@@ -1,4 +1,7 @@
-Building an affine term structure model of yields for our Master Thesis in Economics at SSE
+----- Building an affine term structure model of yields for our Master Thesis in Economics at SSE -----
+
+
+
 
 yields.py – constructs zero coupon yields for Swedish inflation linked government bonds and nominal bonds. 
 
