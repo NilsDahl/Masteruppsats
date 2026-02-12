@@ -1,1 +1,1 @@
-Building a affine term structure model of yields for out Master Thesis in Economics at SSE
+Building an affine term structure model of yields for our Master Thesis in Economics at SSE
