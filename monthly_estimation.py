@@ -419,54 +419,111 @@ X_tp1   = X_tp1_df.to_numpy()     # (T, K)
 
 T_pi, NR = rx_real.shape
 K = X_t.shape[1]
+real_maturities = REAL_RET_MONTHS_FULLYEARS 
+
+# short rate at time t, aligned exactly to rx_real sample
+r_t_series = df_model_data["short_rate_dec"].reindex(rx_real_df.index)
+
+# apply the SAME mask used for rx_real, X_t, X_tp1
+r_t_aligned = r_t_series.loc[mask].to_numpy()   # shape (T_pi,)
 
 print("Step 13 aligned shapes:", rx_real.shape, X_t.shape, X_tp1.shape)
 
-# 13.3 Build B_real by slicing your existing B_gls
-# asset_order is sorted by type then maturity, so real assets are the ones starting with "real_"
-real_assets = [a for a in asset_order if a.startswith("real_")]
-real_idx = [asset_order.index(a) for a in real_assets]
+def tips_loadings_A_B(pi0, pi1, mu_tilde, Phi_tilde, Sigma, delta0, delta1, max_n):
+    """
+    Build A_R[n], B_R[n] for n = 0..max_n (n in months), using Abrahams et al. recursions (10)-(11).
 
-B_real = B_gls[real_idx, :]       # (NR, K)
+    Conventions:
+    logP_t,R(n) = A_R[n] + B_R[n]' X_t
 
-print("B_real shape:", B_real.shape, "NR:", NR, "len(real_assets):", len(real_assets))
+    delta0, delta1 come from short rate regression: r_t = delta0 + delta1' X_t
+    delta0_R = delta0 - pi0  (paper: δ0,R = δ0 - π0)
+    """
+    K = len(pi1)
 
-def objective(params):
-    pi0 = params[0]
-    pi1 = params[1:]  # (K,)
+    A = np.zeros(max_n + 1)              # A_R[0] = 0
+    B = np.zeros((max_n + 1, K))         # B_R[0] = 0
 
-    sse = 0.0
-    for i in range(NR):
-        b = B_real[i, :]
-        b_tilde = b + pi1
+    delta0_R = delta0 - pi0
 
-        alpha = -(
-            pi0
-            + b_tilde @ mu_tilde_gls
-            + 0.5 * (b_tilde @ Sigma @ b_tilde)
+    for n in range(1, max_n + 1):
+        B_pi_prev = B[n-1] + pi1  # B^pi_{n-1,R} = B_{n-1,R} + pi1
+
+        # Eq (11): B_n,R' = B^pi_{n-1,R}' Phi_tilde - delta1'
+        B[n] = Phi_tilde.T @ B_pi_prev - delta1
+
+        # Eq (10): A_n,R = A_{n-1,R} + B^pi_{n-1,R}' mu_tilde
+        #            + 0.5 B^pi_{n-1,R}' Sigma B^pi_{n-1,R} - delta0_R
+        A[n] = (
+            A[n-1]
+            + B_pi_prev @ mu_tilde
+            + 0.5 * (B_pi_prev @ Sigma @ B_pi_prev)
+            - delta0_R
         )
 
-        for t in range(T_pi):
-            model_rx = (
-                alpha
-                - b_tilde @ (Phi_tilde_gls @ X_t[t, :])
-                + b @ X_tp1[t, :]
-            )
-            err = rx_real[t, i] - model_rx
-            sse += err**2
+    return A, B
 
-    return sse
+def model_rx_real(A, B, X_t, X_tp1, r_t, maturities_months):
+    """
+    Returns matrix (T x NR) of model implied real one month excess returns
+    for maturities in maturities_months (in months).
+    """
+    T = X_t.shape[0]
+    NR = len(maturities_months)
+
+    rx_hat = np.zeros((T, NR))
+
+    for j, n in enumerate(maturities_months):
+        # logP_{t+1}(n-1)
+        logP_tp1_n1 = A[n-1] + X_tp1 @ B[n-1]
+
+        # logP_t(n)
+        logP_t_n = A[n] + X_t @ B[n]
+
+        rx_hat[:, j] = logP_tp1_n1 - logP_t_n - r_t
+
+    return rx_hat
+
+from scipy.optimize import least_squares
+
+max_n = int(max(real_maturities))  # 120 for you
+
+def residuals_pi(params):
+    pi0 = params[0]
+    pi1 = params[1:]
+
+    A_R, B_R = tips_loadings_A_B(
+        pi0=pi0,
+        pi1=pi1,
+        mu_tilde=mu_tilde_gls,
+        Phi_tilde=phi_gls,
+        Sigma=Sigma,
+        delta0=delta0,
+        delta1=delta1.to_numpy() if hasattr(delta1, "to_numpy") else delta1,
+        max_n=max_n
+    )
+
+    rx_hat = model_rx_real(A_R, B_R, X_t, X_tp1, r_t_aligned, real_maturities)
+
+    # flatten residuals to 1D for least_squares
+    return (rx_real - rx_hat).ravel()
 
 x0 = np.zeros(1 + K)
 
-res_nm = minimize(
-    objective,
+res = least_squares(
+    residuals_pi,
     x0,
-    method="Nelder-Mead",
-    options={"maxiter": 20000, "xatol": 1e-10, "fatol": 1e-10}
+    method="trf",
+    loss="huber",      # stabilizes when some maturities are noisy
+    f_scale=1.0,
+    max_nfev=20000
 )
 
-print("NM success:", res_nm.success)
-print("NM message:", res_nm.message)
-print("pi0_hat:", res_nm.x[0])
-print("pi1_hat:", res_nm.x[1:])
+pi0_hat = res.x[0]
+pi1_hat = res.x[1:]
+
+print("LS success:", res.success)
+print("status:", res.status, "message:", res.message)
+print("pi0_hat:", pi0_hat)
+print("pi1_hat:", pi1_hat)
+

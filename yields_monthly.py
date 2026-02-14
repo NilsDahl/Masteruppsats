@@ -16,13 +16,12 @@ MODEL_NOMINAL = "NSS"   # suggested for nominal (more pillars)
 MODEL_REAL    = "NS"    # suggested for real (few pillars)
 
 # Grids in MONTHS (what you asked for)
-GRID_NOMINAL_MONTHS = np.arange(6, 121, 1)     # 6..120 months
-GRID_REAL_MONTHS    = np.arange(24, 121, 1)    # 24..120 months
+GRID_NOMINAL_MONTHS = np.arange(5, 121, 1)     # 6..120 months
+GRID_REAL_MONTHS    = np.arange(23, 121, 1)    # 24..120 months
 
 # Output files
 OUTPUT_XLSX_NOM = "nominal_eom_zero_coupon_yields_monthly_grid.xlsx"
 OUTPUT_XLSX_REAL = "real_eom_zero_coupon_yields_monthly_grid.xlsx"
-
 
 # ============================================================
 # 1) Read and prep raw data
@@ -266,7 +265,7 @@ print("Nominal curve fitted on months:", GRID_NOMINAL_MONTHS[0], "..", GRID_NOMI
 # Plot a few sample dates of nominal fitted curve (dense-ish monthly grid already)
 sample_dates = fitted_nom.index[::12]  # every 12 months
 plt.figure(figsize=(10, 6))
-for dt in sample_dates[:6]:
+for dt in sample_dates[:14]:
     y = fitted_nom.loc[dt].to_numpy(float)
     plt.plot(GRID_NOMINAL_MONTHS, y, alpha=0.8)
 plt.title(f"Nominal fitted ZC yields ({MODEL_NOMINAL}) on monthly maturity grid")
@@ -276,7 +275,7 @@ plt.tight_layout()
 plt.show()
 
 plt.figure(figsize=(10, 6))
-for dt in fitted_real.index[::12][:6]:
+for dt in fitted_real.index[::12][:14]:
     y = fitted_real.loc[dt].to_numpy(float)
     plt.plot(GRID_REAL_MONTHS, y, alpha=0.8)
 plt.title(f"Real fitted ZC yields ({MODEL_REAL}) on monthly maturity grid")
@@ -285,17 +284,48 @@ plt.ylabel("Yield (%)")
 plt.tight_layout()
 plt.show()
 
-
 # ============================================================
 # 7) Export
 # ============================================================
 # Export fitted monthly-grid yields (in %)
-fitted_nom.to_excel(OUTPUT_XLSX_NOM, sheet_name="yields_monthgrid")
-params_nom.to_excel(OUTPUT_XLSX_NOM.replace(".xlsx", "_params.xlsx"), sheet_name="params")
+fitted_nom.to_excel(OUTPUT_XLSX_NOM)
+params_nom.to_excel(OUTPUT_XLSX_NOM.replace(".xlsx", "_params.xlsx"))
 print(f"Wrote: {OUTPUT_XLSX_NOM}")
 print(f"Wrote: {OUTPUT_XLSX_NOM.replace('.xlsx','_params.xlsx')}")
 
-fitted_real.to_excel(OUTPUT_XLSX_REAL, sheet_name="yields_monthgrid")
-params_real.to_excel(OUTPUT_XLSX_REAL.replace(".xlsx", "_params.xlsx"), sheet_name="params")
+fitted_real.to_excel(OUTPUT_XLSX_REAL)
+params_real.to_excel(OUTPUT_XLSX_REAL.replace(".xlsx", "_params.xlsx"))
 print(f"Wrote: {OUTPUT_XLSX_REAL}")
 print(f"Wrote: {OUTPUT_XLSX_REAL.replace('.xlsx','_params.xlsx')}")
+
+# ============================================================
+# 1M short rate export (model-implied from fitted NSS/NS)
+# ============================================================
+
+SHORT_RATE_XLSX = "short_rate.xlsx"
+t_1m = 1.0 / 12.0  # 1 month in years
+
+if MODEL_NOMINAL.upper() == "NS":
+    y_1m = []
+    for dt, row in params_nom.iterrows():
+        if row.isna().any():
+            y_1m.append(np.nan)
+            continue
+        curve = NelsonSiegelCurve(beta0=row["beta0"], beta1=row["beta1"], beta2=row["beta2"], tau=row["tau"])
+        y_1m.append(float(curve(t_1m) * 100.0))  # to %
+
+elif MODEL_NOMINAL.upper() == "NSS":
+    y_1m = []
+    for dt, row in params_nom.iterrows():
+        if row.isna().any():
+            y_1m.append(np.nan)
+            continue
+        curve = NelsonSiegelSvenssonCurve(
+            beta0=row["beta0"], beta1=row["beta1"], beta2=row["beta2"], beta3=row["beta3"],
+            tau1=row["tau1"], tau2=row["tau2"]
+        )
+        y_1m.append(float(curve(t_1m) * 100.0))  # to %
+
+short_rate_df = pd.DataFrame({"y_1m": y_1m}, index=params_nom.index)
+short_rate_df.to_excel(SHORT_RATE_XLSX)
+print(f"Wrote: {SHORT_RATE_XLSX}")
