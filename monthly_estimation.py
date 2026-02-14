@@ -4,6 +4,7 @@ from statsmodels.tsa.api import VAR
 import numpy as np
 import matplotlib.pyplot as plt
 from statsmodels.stats.diagnostic import acorr_ljungbox
+from scipy.optimize import minimize
 
 
 # ============================================================
@@ -300,7 +301,7 @@ T = E_hat.shape[0]
 Sigma_e_hat = (E_hat.T @ E_hat) / T
 W = np.linalg.inv(Sigma_e_hat)
 
-phi_gls = np.linalg.inv(B_ols.T @ W @ B_ols) @ (B_ols.T @ W @ Bphi_ols)
+phi_gls = -np.linalg.inv(B_ols.T @ W @ B_ols) @ (B_ols.T @ W @ Bphi_ols)
 
 print("phi_gls shape:", phi_gls.shape)
 print("VAR Phi shape:", Phi.shape)
@@ -322,69 +323,150 @@ else:
 # 11) Recover α_gls and B_gls via "SUR" on [1, Z_t]
 #     Model: R_pi,t = α + B Z_t + e_t
 # ============================================================
-# 11.1 Drop rows where X_{t+1} is missing (last observation)
-mask_z = X_minus.notna().all(axis=1) & X_now.notna().all(axis=1)
-X_minus = X_minus.loc[mask_z]
-X_now   = X_now.loc[mask_z]
-
-# Recompute Z with the filtered index to be safe
-Z = X_now.to_numpy() - X_minus.to_numpy() @ phi_gls.T   # T x K
-
-# Design matrix: [1, Z]
-X_sur = np.column_stack([np.ones(Z.shape[0]), Z])        # T x (1+K)
-
-# The dates corresponding to rows of X_sur
-z_dates = pd.to_datetime(X_minus.index)
-
-# 11.2 Build Y = R_pi in wide form (T x N), using the same asset order as before
+# 11.0 Build Y panel first to define return dates
 Rpi_wide = (
     df_ols_long.pivot(index="date", columns="asset", values="R_pi")
     .sort_index()
     .reindex(columns=asset_order)
 )
 Rpi_wide.index = pd.to_datetime(Rpi_wide.index)
+ret_dates = Rpi_wide.index
 
-# Align Y to the Z dates
+# 11.1 Define X_t and X_{t+1}, aligned to return dates
+X_minus = df_model_data[state_factors].reindex(ret_dates)              # X_t
+X_now   = df_model_data[state_factors].shift(-1).reindex(ret_dates)    # X_{t+1} aligned to t
+
+mask_z = X_minus.notna().all(axis=1) & X_now.notna().all(axis=1)
+X_minus = X_minus.loc[mask_z]
+X_now   = X_now.loc[mask_z]
+
+# Z_t = -Phi_tilde X_t + X_{t+1}
+Z = X_now.to_numpy() - X_minus.to_numpy() @ phi_gls.T
+
+X_sur = np.column_stack([np.ones(Z.shape[0]), Z])
+z_dates = X_minus.index
+
+# 11.2 Align Y to z_dates and enforce complete panel across assets
 Rpi_wide = Rpi_wide.reindex(z_dates)
 
-# Keep only rows where we have returns for all assets
 mask_y = Rpi_wide.notna().all(axis=1).to_numpy()
-Y = Rpi_wide.loc[mask_y].to_numpy()          # T_eff x N
-X_sur = X_sur[mask_y, :]                     # T_eff x (1+K)
+Y = Rpi_wide.loc[mask_y].to_numpy()
+X_sur = X_sur[mask_y, :]
 
 T_eff, N = Y.shape
 K = len(state_factors)
 
 print("SUR design X_sur:", X_sur.shape, "Y:", Y.shape)
 
-# 11.3 Multivariate OLS (same point estimates as SUR here because regressors are common)
-# Coefficient matrix C_hat is (1+K) x N
+# 11.3 Multivariate OLS
 C_hat = np.linalg.inv(X_sur.T @ X_sur) @ (X_sur.T @ Y)
 
-# Parse coefficients into α and B
-alpha_gls = C_hat[0, :]          # N
-B_gls     = C_hat[1:, :].T       # N x K
+alpha_gls = C_hat[0, :]
+B_gls     = C_hat[1:, :].T
 
-print("alpha_gls:", alpha_gls.shape, "B_gls:", B_gls.shape)
-
-# 11.4 Residuals and updated Sigma_e (recommended for eq (30))
-E_sur = Y - X_sur @ C_hat                      # T_eff x N
-Sigma_e_hat_sur = (E_sur.T @ E_sur) / T_eff    # N x N
+#E_sur = Y - X_sur @ C_hat
+#Sigma_e_hat_sur = (E_sur.T @ E_sur) / T_eff
 
 # ============================================================
-# 12) Compute mu_tilde_gls from eq (30)
-#     mu_tilde_gls = - (B' Σ_e^{-1} B)^{-1} B' Σ_e^{-1} (α + 1/2 γ)
+# 12) Recover mu_tilde_gls via Eq. (30) using alpha_gls, B_gls, Sigma_e_hat, and Sigma_hat
 # ============================================================
 
-# γ_i = b_i' Σ b_i where Σ is the VAR shock covariance (K x K)
-gamma_gls = np.einsum("ik,kl,il->i", B_gls, Sigma, B_gls)   # N
-#   γ_i = B_i' Σ B_i   for i = 1,...,N
+# 1) Build gamma_hat_gls (Eq. 27): gamma_i = b_i' Σ b_i for each row b_i of B_gls
+#    Result shape (N,)
+gamma_hat_gls = np.einsum("ik,kl,il->i", B_gls, Sigma, B_gls)
 
-W_sur = np.linalg.inv(Sigma_e_hat_sur)
+# 2) Form RHS vector (alpha + 1/2 gamma), shape (N,)
+rhs = alpha_gls + 0.5 * gamma_hat_gls
 
-BW_B   = B_gls.T @ W_sur @ B_gls                            # K x K
-BW_vec = B_gls.T @ W_sur @ (alpha_gls + 0.5 * gamma_gls)    # K
+# 3) Compute mu_tilde_gls (Eq. 30)
+Sigma_e_inv = np.linalg.inv(Sigma_e_hat)
 
-mu_tilde_gls = -np.linalg.inv(BW_B) @ BW_vec                # K
+M = B_gls.T @ Sigma_e_inv @ B_gls          # (K, K)
+v = B_gls.T @ Sigma_e_inv @ rhs            # (K,)
 
+mu_tilde_gls = -np.linalg.solve(M, v)      # (K,)
+
+print("mu_tilde_gls shape:", mu_tilde_gls.shape)
 print("mu_tilde_gls:", mu_tilde_gls)
+
+# ============================================================
+# 13) Build required inputs for pi0, pi1 minimization (minimal)
+# ============================================================
+
+# 13.1 Phi_tilde
+Phi_tilde_gls = phi_gls
+
+# 13.2 rx_real, X_t, X_tp1 aligned on the SAME t-dates
+# rx1m_real is already rx_{t->t+1}, so its index corresponds to "t"
+rx_real_df = rx1m_real.copy().sort_index()
+
+X_t_df   = df_model_data[state_factors].reindex(rx_real_df.index)
+X_tp1_df = df_model_data[state_factors].shift(-1).reindex(rx_real_df.index)
+
+mask = (
+    rx_real_df.notna().all(axis=1)
+    & X_t_df.notna().all(axis=1)
+    & X_tp1_df.notna().all(axis=1)
+)
+
+rx_real_df = rx_real_df.loc[mask]
+X_t_df     = X_t_df.loc[mask]
+X_tp1_df   = X_tp1_df.loc[mask]
+
+rx_real = rx_real_df.to_numpy()   # (T, NR)
+X_t     = X_t_df.to_numpy()       # (T, K)
+X_tp1   = X_tp1_df.to_numpy()     # (T, K)
+
+T_pi, NR = rx_real.shape
+K = X_t.shape[1]
+
+print("Step 13 aligned shapes:", rx_real.shape, X_t.shape, X_tp1.shape)
+
+# 13.3 Build B_real by slicing your existing B_gls
+# asset_order is sorted by type then maturity, so real assets are the ones starting with "real_"
+real_assets = [a for a in asset_order if a.startswith("real_")]
+real_idx = [asset_order.index(a) for a in real_assets]
+
+B_real = B_gls[real_idx, :]       # (NR, K)
+
+print("B_real shape:", B_real.shape, "NR:", NR, "len(real_assets):", len(real_assets))
+
+def objective(params):
+    pi0 = params[0]
+    pi1 = params[1:]  # (K,)
+
+    sse = 0.0
+    for i in range(NR):
+        b = B_real[i, :]
+        b_tilde = b + pi1
+
+        alpha = -(
+            pi0
+            + b_tilde @ mu_tilde_gls
+            + 0.5 * (b_tilde @ Sigma @ b_tilde)
+        )
+
+        for t in range(T_pi):
+            model_rx = (
+                alpha
+                - b_tilde @ (Phi_tilde_gls @ X_t[t, :])
+                + b @ X_tp1[t, :]
+            )
+            err = rx_real[t, i] - model_rx
+            sse += err**2
+
+    return sse
+
+x0 = np.zeros(1 + K)
+
+res_nm = minimize(
+    objective,
+    x0,
+    method="Nelder-Mead",
+    options={"maxiter": 20000, "xatol": 1e-10, "fatol": 1e-10}
+)
+
+print("NM success:", res_nm.success)
+print("NM message:", res_nm.message)
+print("pi0_hat:", res_nm.x[0])
+print("pi1_hat:", res_nm.x[1:])
