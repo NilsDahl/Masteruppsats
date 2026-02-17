@@ -61,6 +61,8 @@ REAL_RET_MONTHS_FULLYEARS = np.arange(24, 121, 12)  # 36, 48, ..., 120
 # ============================================================
 df_f = read_excel_date_index(factors_path, sheet_name=0)
 
+print("Post-standardization std:\n", df_model_data[state_factors].std())
+
 df_inf = (
     read_excel_date_index(macro_path, sheet_name="inflation")
     .rename(columns={"monthly log": "inflation"})
@@ -76,6 +78,14 @@ df_r = df_r[["short_rate_dec"]]
 
 # Merge into one aligned panel
 df_model_data = df_f.join([df_inf, df_r], how="inner").sort_index()
+
+X = df_model_data[state_factors].astype(float)
+X_mean = X.mean()
+X_std  = X.std(ddof=0).replace(0, 1.0)     #### demean and scale to unit variance (prevents scaling issues in regression and optimization)
+df_model_data[state_factors] = (X - X_mean) / X_std
+
+print("CHECK means:\n", df_model_data[state_factors].mean())
+print("CHECK stds:\n", df_model_data[state_factors].std(ddof=0))
 
 # Keep required columns
 keep_cols = df_f.columns.tolist() + ["inflation", "short_rate_dec"]
@@ -268,23 +278,37 @@ E_hat = (
     .sort_index()
     .reindex(columns=asset_order)
 )
+# Build Sigma_e_hat
+T_e = E_hat.shape[0]
+Sigma_e_hat = (E_hat.to_numpy().T @ E_hat.to_numpy()) / T_e
+# Eigen floor (ridge) to ensure SPD
+eigvals = np.linalg.eigvalsh(Sigma_e_hat)
+lam_min = np.min(eigvals)
+print("Sigma_e_hat eig min/max:", lam_min, np.max(eigvals))
+ridge = max(1e-10, 1e-6 * np.max(eigvals))   # you can tune 1e-6 -> 1e-4 if needed
+Sigma_e_ridge = Sigma_e_hat + ridge * np.eye(Sigma_e_hat.shape[0])
+W = np.linalg.inv(Sigma_e_ridge)  # now safe
 
 # ============================================================
 # 9) Recover Phi_tilde via GLS identity (Abrahams-style)
 #     coeff_now  = -B * Phi_tilde
 #     coeff_lead =  B
 # ============================================================
-B_ols = params_df[x_lead_cols].to_numpy()        # B
-Bphi_ols = -params_df[x_now_cols].to_numpy()     # B * Phi_tilde
 
-T = E_hat.shape[0]
-Sigma_e_hat = (E_hat.T @ E_hat) / T
-W = np.linalg.inv(Sigma_e_hat)
+B_ols = params_df[x_lead_cols].to_numpy(dtype=float)      # (N, K)
+coeff_now = params_df[x_now_cols].to_numpy(dtype=float)   # (N, K)
+Bphi_target = -coeff_now                                   # (N, K)
 
-phi_gls = -np.linalg.inv(B_ols.T @ W @ B_ols) @ (B_ols.T @ W @ Bphi_ols)
+lhs = B_ols.T @ W @ B_ols
+rhs = B_ols.T @ W @ Bphi_target
 
-print("phi_gls shape:", phi_gls.shape)
-print("VAR Phi shape:", Phi.shape)
+# Ridge on lhs if needed
+ridge_lhs = 1e-10 * np.trace(lhs) / lhs.shape[0]
+phi_gls = np.linalg.solve(lhs + ridge_lhs*np.eye(lhs.shape[0]), rhs)
+
+eig = np.linalg.eigvals(phi_gls)
+print("cond(lhs):", np.linalg.cond(lhs))
+print("max |eig(phi_gls)|:", np.max(np.abs(eig)))
 
 # ============================================================
 # 10) Quick residual plot
@@ -369,15 +393,45 @@ print("mu_tilde_gls:", mu_tilde_gls)
 # ============================================================
 # 13) Build required inputs for pi0, pi1 minimization (minimal)
 # ============================================================
-# 13.0 Inputs
-Phi_tilde_use = phi_gls
+# ============================================================
+# 13) π0, π1 estimation (Eq. 31) — updated for consistent scaling
+#     Assumes:
+#       - state_factors are already in DECIMAL units (PCs/yields scaled /100 in your factor build)
+#       - short_rate_dec is MONTHLY decimal (r_1m), not annual
+#       - phi_gls is close to stable, but we enforce stability via a small shrink
+# ============================================================
+# ============================================================
+# 13) Estimate (pi0, pi1) from real-bond return fitting errors
+#     Robust version: stabilizes Phi_tilde, avoids flat penalty objective,
+#     and prints diagnostics if you keep hitting caps.
+# ============================================================
+# ----------------------------
+# 13.0 Inputs (fixed from earlier steps)
+# ----------------------------
 mu_tilde_use  = mu_tilde_gls
 Sigma_use     = Sigma
+Phi_tilde_raw = phi_gls
 
-# short rate must be MONTHLY decimal already
+# short rate must be 1-month (same units as rx and logP)
 short_rate_monthly = df_model_data["short_rate_dec"]
 
-# 13.1 Monthly short-rate regression: r_1m = delta0_m + delta1_m' X_t
+# ----------------------------
+# 13.0a Stabilize Phi_tilde (CRUCIAL if |eig| >= 1)
+# ----------------------------
+def stabilize_phi(Phi, target=0.995):
+    eigvals = np.linalg.eigvals(Phi)
+    maxabs = np.max(np.abs(eigvals))
+    if maxabs <= target:
+        return Phi, maxabs, 1.0
+    scale = target / maxabs
+    return Phi * scale, maxabs, scale
+
+Phi_tilde_use, maxabs_raw, scale_phi = stabilize_phi(Phi_tilde_raw, target=0.995)
+print(f"Phi_tilde max|eig| raw={maxabs_raw:.6f}, scaled by {scale_phi:.6f}, new max|eig|={np.max(np.abs(np.linalg.eigvals(Phi_tilde_use))):.6f}")
+
+# ----------------------------
+# 13.1 Monthly short-rate regression: r_t = delta0_m + delta1_m' X_t
+# ----------------------------
 df_rate_reg = (
     df_model_data[state_factors]
     .join(short_rate_monthly.rename("r_1m"), how="inner")
@@ -388,14 +442,13 @@ df_rate_reg = (
 y_rate = df_rate_reg["r_1m"].astype(float).to_numpy()
 X_rate = sm.add_constant(df_rate_reg[state_factors].astype(float), has_constant="add").to_numpy()
 b_rate = np.linalg.lstsq(X_rate, y_rate, rcond=None)[0]
-
 delta0_m = float(b_rate[0])
 delta1_m = b_rate[1:].astype(float)
 
 print("Rate regression done (monthly). delta0_m:", delta0_m)
 
 # ----------------------------
-# 13.2 Align rx_real, X_t, X_{t+1}, r_t on SAME t-dates
+# 13.2 Align rx_real, X_t, X_{t+1}, r_t (same t-index)
 # ----------------------------
 rx_real_df = rx1m_real.copy().sort_index()
 
@@ -412,7 +465,6 @@ rx_real_df = rx_real_df.loc[mask]
 X_t_df     = X_t_df.loc[mask]
 X_tp1_df   = X_tp1_df.loc[mask]
 
-# Align r_t AFTER filtering
 r_t_aligned = short_rate_monthly.reindex(rx_real_df.index).to_numpy(dtype=float)
 
 rx_real = rx_real_df.to_numpy(dtype=float)  # (T, NR)
@@ -433,23 +485,34 @@ tmp_pi = df_model_data[["infl_1m"] + state_factors].dropna().copy()
 y_pi = tmp_pi["infl_1m"].astype(float).to_numpy()
 X_pi = sm.add_constant(tmp_pi[state_factors].astype(float), has_constant="add").to_numpy()
 b_pi = np.linalg.lstsq(X_pi, y_pi, rcond=None)[0]
-
 x0 = np.r_[float(b_pi[0]), b_pi[1:].astype(float)]
-print("Initial π from inflation regression:", x0)
 
 # ----------------------------
-# 13.4 Safe recursions + safe model rx (prevents NaN/Inf under finite differences)
+# 13.4 Bounds + force x0 inside bounds (prevents "outside bounds")
 # ----------------------------
-# Residual scaling for conditioning
+pi0_lo, pi0_hi = -0.20, 0.20
+pi1_lo, pi1_hi = -1.0,  1.0
+
+lb = np.r_[pi0_lo, np.full(K, pi1_lo)]
+ub = np.r_[pi0_hi, np.full(K, pi1_hi)]
+
+x0 = np.minimum(np.maximum(x0, lb + 1e-12), ub - 1e-12)
+print("Initial π (clipped into bounds):", x0)
+
+# ----------------------------
+# 13.5 Safe recursions + diagnostics
+# ----------------------------
 rx_std = np.std(rx_real, axis=0, ddof=0)
 rx_std[~np.isfinite(rx_std)] = 1.0
 rx_std[rx_std == 0] = 1.0
 
-# Safety caps (log-units)
-A_CAP  = 1e4
-B_CAP  = 1e3
-RX_CAP = 1e3
+# Tight caps reveal what's blowing up; loosen after you get it working
+A_CAP  = 1e3
+B_CAP  = 1e2
+RX_CAP = 1e1
 PEN    = 1e6
+
+dbg = {"none_AB":0, "cap_AB":0, "none_rx":0, "cap_rx":0, "nan_res":0}
 
 def tips_loadings_A_B_safe(pi0, pi1, mu_tilde, Phi_tilde, Sigma, delta0_m, delta1_m, max_n):
     A = np.zeros(max_n + 1, dtype=float)
@@ -461,16 +524,15 @@ def tips_loadings_A_B_safe(pi0, pi1, mu_tilde, Phi_tilde, Sigma, delta0_m, delta
         Bn = Phi_tilde.T @ B_pi_prev - delta1_m
         An = A[n-1] + B_pi_prev @ mu_tilde + 0.5 * (B_pi_prev @ Sigma @ B_pi_prev) - delta0_R
 
-        # hard guards (critical for TRF finite differences)
         if (not np.isfinite(Bn).all()) or (not np.isfinite(An)):
-            return None, None
+            return None, None, "none_AB"
         if np.max(np.abs(Bn)) > B_CAP or abs(An) > A_CAP:
-            return None, None
+            return None, None, "cap_AB"
 
         B[n] = Bn
         A[n] = An
 
-    return A, B
+    return A, B, None
 
 def model_rx_real_safe(A, B, X_t, X_tp1, r_t, maturities_months):
     T = X_t.shape[0]
@@ -480,43 +542,41 @@ def model_rx_real_safe(A, B, X_t, X_tp1, r_t, maturities_months):
     for j, n in enumerate(maturities_months):
         v = (A[n-1] + X_tp1 @ B[n-1]) - (A[n] + X_t @ B[n]) - r_t
         if not np.isfinite(v).all():
-            return None
+            return None, "none_rx"
         if np.max(np.abs(v)) > RX_CAP:
-            return None
+            return None, "cap_rx"
         out[:, j] = v
 
-    return out
+    return out, None
 
 def residuals_pi(params):
     pi0 = float(params[0])
     pi1 = np.asarray(params[1:], dtype=float)
 
-    A_R, B_R = tips_loadings_A_B_safe(
-        pi0, pi1,
-        mu_tilde_use, Phi_tilde_use, Sigma_use,
-        delta0_m, delta1_m,
-        max_n
+    A_R, B_R, reason = tips_loadings_A_B_safe(
+        pi0, pi1, mu_tilde_use, Phi_tilde_use, Sigma_use, delta0_m, delta1_m, max_n
     )
     if A_R is None:
+        dbg[reason] += 1
         return np.full(T_pi * NR, PEN, dtype=float)
 
-    rx_hat = model_rx_real_safe(A_R, B_R, X_t, X_tp1, r_t_aligned, real_maturities)
+    rx_hat, reason2 = model_rx_real_safe(A_R, B_R, X_t, X_tp1, r_t_aligned, real_maturities)
     if rx_hat is None:
+        dbg[reason2] += 1
         return np.full(T_pi * NR, PEN, dtype=float)
 
     res = (rx_real - rx_hat) / rx_std
     if not np.isfinite(res).all():
+        dbg["nan_res"] += 1
         return np.full(T_pi * NR, PEN, dtype=float)
 
     return res.ravel()
-# ----------------------------
-# 13.5 Solve with TRF + bounds, small diff_step (prevents NaN Jacobian)
-# ----------------------------
-pi0_lo, pi0_hi = -0.05, 0.05
-pi1_lo, pi1_hi = -1.0, 1.0
 
-lb = np.r_[pi0_lo, np.full(K, pi1_lo)]
-ub = np.r_[pi0_hi, np.full(K, pi1_hi)]
+# quick sensitivity check BEFORE optimize: if these are identical, you're still flat/penalized
+eps = 1e-4
+print("SSE(x0):", np.sum(residuals_pi(x0)**2))
+print("SSE(pi0+eps):", np.sum(residuals_pi(x0 + np.r_[eps, np.zeros(K)])**2))
+print("SSE(pi1_1+eps):", np.sum(residuals_pi(x0 + np.r_[0.0, eps, *np.zeros(K-1)])**2))
 
 res = least_squares(
     residuals_pi,
@@ -525,7 +585,7 @@ res = least_squares(
     bounds=(lb, ub),
     loss="linear",
     x_scale="jac",
-    diff_step=1e-6,          # IMPORTANT
+    diff_step=1e-6,
     ftol=1e-12, xtol=1e-12, gtol=1e-12,
     max_nfev=20000,
     verbose=2
@@ -539,6 +599,8 @@ print("status:", res.status, "message:", res.message)
 print("pi0_hat:", pi0_hat)
 print("pi1_hat:", pi1_hat)
 print("SSE (scaled):", float(np.sum(res.fun**2)))
+print("Penalty diagnostics:", dbg)
+
 
 
 ####### ============================================================
@@ -583,4 +645,20 @@ pi1_init = b_pi[1:].astype(float)
 print("pi0_init:", pi0_init)
 print("pi1_init shape:", pi1_init.shape)
 
+eig = np.linalg.eigvals(phi_gls)
+print("eig(phi_gls) max abs:", np.max(np.abs(eig)))
+print("eig(phi_gls):", eig)
+
+
+X = df_model_data[state_factors].dropna()
+print(X.describe().T[["mean","std","min","max"]])
+
+phi1 = -np.linalg.inv(B_ols.T @ W @ B_ols) @ (B_ols.T @ W @ Bphi_ols)        # your current
+phi2 = -np.linalg.inv(B_ols.T @ W @ B_ols) @ (B_ols.T @ W @ Bphi_ols).T       # transpose RHS
+phi3 = -np.linalg.inv(B_ols.T @ W @ B_ols) @ (B_ols.T @ W @ Bphi_ols) @ np.eye(K)  # same, placeholder
+phi4 = -np.linalg.inv(B_ols.T @ W @ B_ols) @ (B_ols.T @ W @ Bphi_ols)         # then take .T later
+
+for i, ph in enumerate([phi1, phi2, phi1.T, phi2.T], start=1):
+    eig = np.linalg.eigvals(ph)
+    print(i, np.max(np.abs(eig)), eig)
 
