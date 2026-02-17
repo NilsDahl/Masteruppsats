@@ -27,9 +27,9 @@ real = real.sort_values("date").set_index("date")
 nom_cols = ["y_0.5y"] + [f"y_{i}y" for i in range(1, 11)]  # 0.5y–10y
 real_cols = [f"y_{i}y" for i in range(2, 11)]             # 2y–10y
 
-# Select panels (no alignment / no dropping needed)
-nom_sel = nom[nom_cols].copy()
-real_sel = real[real_cols].copy()
+# Select panels (an convert yields to decimals)
+nom_sel  = nom[nom_cols].copy() / 100.0
+real_sel = real[real_cols].copy() / 100.0
 
 print("Nominal panel:", nom_sel.shape)
 print("Real panel:", real_sel.shape)
