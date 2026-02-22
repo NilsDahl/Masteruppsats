@@ -169,20 +169,27 @@ df_counts["Total_transactions"] = df_counts["GVB"] + df_counts["ILB"]
 # 3) ILB transaction share
 df_counts["ILB_tx_share"] = df_counts["ILB"] / df_counts["Total_transactions"]
 
-# Daily ILB share (transaction-count based)
+# Rename Period -> Month
+df_counts.index.name = "Month"
+
+# ILB share (transaction count based)
 df_counts["ILB_share"] = df_counts["ILB"] / (df_counts["ILB"] + df_counts["GVB"])
 
 # Log share (avoid log(0))
-df_counts["liquidity_ma3"] = np.log(df_counts["ILB_share"].replace(0, np.nan))
+df_counts["liquidity_ma3"] = np.log(
+    df_counts["ILB_share"].replace(0, np.nan)
+)
 
-# Monthly average of log-share
-liq_monthly = df_counts["liquidity_ma3"].resample("M").mean()
+# Monthly average
+liq_monthly = (
+    df_counts["liquidity_ma3"]
+    .resample("M")
+    .mean()
+)
 
-# 3-month moving average (monthly)
-liq_monthly = liq_monthly.rolling(3).mean()
-
-liq_monthly_ma3 = liq_monthly.dropna()
-
+# 3-month moving average
+liq_monthly_ma3 = liq_monthly.rolling(3).mean()
+liq_monthly_ma3 = liq_monthly_ma3.dropna()
 liq_monthly_ma3.to_excel(
     "turnover_monthly_with_liquidity.xlsx",
     sheet_name="turnover_monthly"

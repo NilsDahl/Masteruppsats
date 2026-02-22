@@ -1,24 +1,28 @@
-
+import os
 import time
 import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ---- Now to the liqudity variable ----
-# start with importing turnover statistics from Riksbanken
-
-### Riksbanken only allow downloading 12 months at a time
-### The problem is RIksbanken only allow 5 calls per minute, so we need one call per year and 26 calls 
-### so the importaking takes 7 minutes
+# ---- Now to the liquidity variable ----
+# Turnover statistics from Riksbanken
 
 BASE_URL = "https://api.riksbank.se/turnover-statistics/v1"
 MARKET = "fi"
 FREQUENCY = "monthly"
 
-SLEEP_BETWEEN_CALLS = 15  # stays under 5 requests/minute
+# Put your key in your shell before running:
+os.environ["RIKSBANK_API_KEY"] = "0460e512bfd8437598e82f4df5aa3437"
+API_KEY = os.getenv("RIKSBANK_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Missing RIKSBANK_API_KEY env var. Set it before running.")
+
 session = requests.Session()
-session.headers.update({"Accept": "application/json"})
+session.headers.update({
+    "Accept": "application/json",
+    "Ocp-Apim-Subscription-Key": API_KEY
+})
 
 def ym_add(ym, months):
     y, m = map(int, ym.split("-"))
@@ -26,19 +30,28 @@ def ym_add(ym, months):
     ny, nm0 = divmod(total, 12)
     return f"{ny:04d}-{nm0+1:02d}"
 
-def fetch_window(start_ym, end_ym):
+def fetch_window(start_ym, end_ym, max_retries=6):
     url = f"{BASE_URL}/markets/{MARKET}/frequencies/{FREQUENCY}"
     params = {"start_date": start_ym, "end_date": end_ym}
 
-    r = session.get(url, params=params)
-    time.sleep(SLEEP_BETWEEN_CALLS)
+    for attempt in range(max_retries):
+        r = session.get(url, params=params, timeout=60)
 
-    # Some windows may return 404 = no data
-    if r.status_code == 404:
-        return pd.DataFrame()
+        if r.status_code == 404:
+            return pd.DataFrame()
 
-    r.raise_for_status()
-    return pd.DataFrame(r.json())
+        if r.status_code == 429:
+            # Respect server guidance if provided
+            retry_after = r.headers.get("Retry-After")
+            wait = int(retry_after) if (retry_after and retry_after.isdigit()) else (1 + attempt)
+            time.sleep(wait)
+            continue
+
+        r.raise_for_status()
+        data = r.json()
+        return pd.DataFrame(data if isinstance(data, list) else [])
+
+    raise RuntimeError(f"Too many 429s for window {start_ym} -> {end_ym}")
 
 def fetch_all_monthly(start_ym, end_ym):
     dfs = []
@@ -61,24 +74,14 @@ def fetch_all_monthly(start_ym, end_ym):
         return pd.DataFrame()
     return pd.concat(dfs, ignore_index=True).drop_duplicates()
 
-## -------  end api call funtions   --------------------------------------------------------
-
 # 1) Download (26 calls for 2000–2025)
 df_all = fetch_all_monthly("2000-01", "2025-12")
 print("Downloaded:", df_all.shape)
 print(df_all.head())
 print(df_all.columns)
 
-
-# we only want gvb and IL, no forwards
-# Counterparties we keep (secondary market), primary market and riksbanken excluded
-SECONDARY_CPTY = {
-    "REP",      # dealers
-    "OMM",      # other market makers
-    "BROKNO",   # interdealer brokers
-    "CUSE",     # Swedish customers
-    "CUFO"      # Non-Swedish customers
-}
+# we only want GVB and ILB, no forwards
+SECONDARY_CPTY = {"REP", "OMM", "BROKNO", "CUSE", "CUFO"}
 
 df_filt = df_all[
     df_all["Asset"].isin(["GVB", "ILB"]) &
@@ -90,10 +93,22 @@ print("Filtered shape:", df_filt.shape)
 print(df_filt.head())
 
 # Make sure date is datetime
-df_filt["Period"] = pd.to_datetime(df_filt["Period"])
+df_filt["Period"] = pd.to_datetime(df_filt["Period"], errors="coerce")
+df_filt = df_filt.dropna(subset=["Period"])
 
 # Month-end timestamp
 df_filt["Month"] = df_filt["Period"].dt.to_period("M").dt.to_timestamp("M")
+
+counts = (
+    df_filt
+    .groupby(["Month", "Asset"])
+    .size()
+    .unstack(fill_value=0)
+    .sort_index()
+)
+
+counts = counts.reindex(columns=["ILB", "GVB"], fill_value=0)
+counts["L_share"] = counts["ILB"] / (counts["ILB"] + counts["GVB"])
 
 # Aggregate turnover
 turnover_monthly = (
@@ -123,6 +138,7 @@ plt.plot(turnover_monthly.index, turnover_monthly["liquidity"], alpha=0.4, label
 plt.plot(turnover_monthly.index, turnover_monthly["liquidity_ma3"], lw=2, label="3m MA")
 plt.title("Relative Illiquidity (ILB vs GVB)")
 plt.legend()
+plt.tight_layout()
 plt.show()
 
 turnover_monthly.to_excel(
