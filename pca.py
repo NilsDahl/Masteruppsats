@@ -8,7 +8,6 @@ import time
 
 # Paths
 NOMINAL_PATH = "nominal_eom_zero_coupon_yields.xlsx"
-REAL_PATH    = "real_eom_zero_coupon_yields.xlsx"
 OUT_PATH     = "nominal_pcs_0.5y_10y.xlsx"
 
 # ----------------------------
@@ -18,21 +17,16 @@ nom = pd.read_excel(NOMINAL_PATH, sheet_name="yields")
 real = pd.read_excel(REAL_PATH, sheet_name="yields")
 
 nom["date"] = pd.to_datetime(nom["date"])
-real["date"] = pd.to_datetime(real["date"])
 
 nom = nom.sort_values("date").set_index("date")
-real = real.sort_values("date").set_index("date")
 
 # Maturity grids
 nom_cols = ["y_0.5y"] + [f"y_{i}y" for i in range(1, 11)]  # 0.5y–10y
-real_cols = [f"y_{i}y" for i in range(2, 11)]             # 2y–10y
 
 # Select panels (an convert yields to decimals)
 nom_sel  = nom[nom_cols].copy() / 100.0
-real_sel = real[real_cols].copy() / 100.0
 
 print("Nominal panel:", nom_sel.shape)
-print("Real panel:", real_sel.shape)
 print("Sample:", nom_sel.index.min().date(), "to", nom_sel.index.max().date())
 
 # ----------------------------

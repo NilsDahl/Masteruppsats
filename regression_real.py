@@ -27,7 +27,8 @@ real_yields = pd.read_excel(
     parse_dates=["date"]
 ).set_index("date")
 real_yields = real_yields[["y_2y","y_3y","y_4y","y_5y","y_6y","y_7y","y_8y","y_9y","y_10y"]]
-
+# convert % points -> decimals
+real_yields = real_yields / 100.0
 
 print(turnover.shape)
 print(nominal_pcs.shape)

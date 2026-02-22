@@ -544,10 +544,6 @@ print("pi0_hat:", pi0_hat)
 print("pi1_hat:", pi1_hat)
 print("SSE (scaled):", float(np.sum(res.fun**2)))
 
-####### ============================================================
-## ML  
-####### ============================================================
-
 # ============================================================
 # INITIAL VALUES Double check 
 # ============================================================
@@ -586,3 +582,203 @@ pi1_init = pi1_hat
 print("pi0_init:", pi0_init)
 print("pi1_init shape:", pi1_init.shape)
 
+# ============================================================
+# 15) Price yields under Q and P + BEI decomposition (liq-adj)
+# Requires already defined: df_model_data, df_nom_y, df_real_y, state_factors,
+# Phi, mu_x, Sigma, phi_gls, mu_tilde_gls, delta0_m, delta1_m, pi0_hat, pi1_hat
+# ============================================================
+
+# --- maturities
+nom_months  = np.array(sorted([col_to_m(c) for c in month_cols(df_nom_y)]), dtype=int)
+real_months = np.array(sorted([col_to_m(c) for c in month_cols(df_real_y)]), dtype=int)
+max_n = int(max(nom_months.max(), real_months.max()))
+K = len(state_factors)
+liq_idx = state_factors.index("Liquidity_MA3")
+
+# --- shared rate/inflation parameters (monthly)
+delta0 = float(delta0_m)
+delta1 = delta1_m.astype(float)
+pi0 = float(pi0_hat)
+pi1 = pi1_hat.astype(float)
+
+# ============================================================
+# Helpers: AB recursions + yield builder + liquidity component
+# ============================================================
+def AB_nominal(Phi_dyn, mu_dyn, Sigma, delta0, delta1, max_n):
+    A = np.zeros(max_n + 1, float)
+    B = np.zeros((max_n + 1, K), float)
+    for n in range(1, max_n + 1):
+        Bn = Phi_dyn.T @ B[n-1] - delta1
+        An = A[n-1] + B[n-1] @ mu_dyn + 0.5*(B[n-1] @ Sigma @ B[n-1]) - delta0
+        A[n], B[n] = An, Bn
+    return A, B
+
+def AB_real(Phi_dyn, mu_dyn, Sigma, delta0, delta1, pi0, pi1, max_n):
+    A = np.zeros(max_n + 1, float)
+    B = np.zeros((max_n + 1, K), float)
+    delta0_R = delta0 - pi0
+    for n in range(1, max_n + 1):
+        B_pi_prev = B[n-1] + pi1
+        Bn = Phi_dyn.T @ B_pi_prev - delta1
+        An = A[n-1] + B_pi_prev @ mu_dyn + 0.5*(B_pi_prev @ Sigma @ B_pi_prev) - delta0_R
+        A[n], B[n] = An, Bn
+    return A, B
+
+def yhat_from_AB(A, B, X_index, months):
+    X_pr = df_model_data[state_factors].reindex(X_index).astype(float).dropna()
+    X = X_pr.to_numpy(float)
+    out = pd.DataFrame(index=X_pr.index)
+    for n in months:
+        tau = n / 12.0
+        out[f"y_{n}m"] = -(A[n] + X @ B[n]) / tau
+    return out, X_pr
+
+# ============================================================
+# Q measure objects (risk-neutral): Phi_tilde, mu_tilde
+# ============================================================
+Phi_Q = phi_gls
+mu_Q  = mu_tilde_gls
+Sigma_Q = Sigma
+
+A_nom_Q, B_nom_Q = AB_nominal(Phi_Q, mu_Q, Sigma_Q, delta0, delta1, max_n)
+A_real_Q, B_real_Q = AB_real(Phi_Q, mu_Q, Sigma_Q, delta0, delta1, pi0, pi1, max_n)
+
+yhat_Q,  Xpr_nom_Q  = yhat_from_AB(A_nom_Q,  B_nom_Q,  df_nom_y.index,  nom_months)
+yhatR_Q, Xpr_real_Q = yhat_from_AB(A_real_Q, B_real_Q, df_real_y.index, real_months)
+
+yobsR_Q = df_real_y.reindex(yhatR_Q.index)[yhatR_Q.columns]
+rmseR_Q = float(np.sqrt(np.nanmean((yhatR_Q - yobsR_Q).to_numpy()**2)))
+print("Real fit RMSE (bp):", rmseR_Q * 10000)
+
+# ============================================================
+# P measure objects (physical): Phi, mu_x
+# ============================================================
+Phi_P = Phi
+mu_P  = mu
+Sigma_P = Sigma
+
+A_nom_P, B_nom_P = AB_nominal(Phi_P, mu_P, Sigma_P, delta0, delta1, max_n)
+A_real_P, B_real_P = AB_real(Phi_P, mu_P, Sigma_P, delta0, delta1, pi0, pi1, max_n)
+
+yhat_P,  Xpr_nom_P  = yhat_from_AB(A_nom_P,  B_nom_P,  df_nom_y.index,  nom_months)
+yhatR_P, Xpr_real_P = yhat_from_AB(A_real_P, B_real_P, df_real_y.index, real_months)
+
+# ============================================================
+# 15b) Quick plots: model vs observed (Q only)
+# ============================================================
+for m in [12, 60, 120]:
+    col = f"y_{m}m"
+    if col in yobs_Q.columns:
+        plt.figure(figsize=(10,4))
+        plt.plot(yobs_Q.index, yobs_Q[col], label="Observed", linewidth=2)
+        plt.plot(yhat_Q.index, yhat_Q[col], label="Model (Q)", linewidth=2)
+        plt.title(f"Nominal Yield Fit (Q): {m} months")
+        plt.legend(); plt.tight_layout(); plt.show()
+
+for m in [24, 60, 120]:
+    col = f"y_{m}m"
+    if col in yobsR_Q.columns:
+        plt.figure(figsize=(10,4))
+        plt.plot(yobsR_Q.index, yobsR_Q[col], label="Observed real", linewidth=2)
+        plt.plot(yhatR_Q.index, yhatR_Q[col], label="Model real (Q)", linewidth=2)
+        plt.title(f"Real Yield Fit (Q): {m} months")
+        plt.legend(); plt.tight_layout(); plt.show()
+
+# ============================================================
+# 16) BEI decomposition: BEI difference: Q - P (bp)
+# ============================================================
+common = sorted(set(yhat_Q.columns).intersection(yhatR_Q.columns).intersection(yhat_P.columns).intersection(yhatR_P.columns))
+
+bei_Q = yhat_Q[common] - yhatR_Q[common]
+bei_P = yhat_P[common] - yhatR_P[common]
+
+bei_diff = bei_Q - bei_P   # this is the gap (IRP + LP if not liq-adjusted)
+
+plot_mats = [24, 60, 120]
+for m in plot_mats:
+    col = f"y_{m}m"
+    if col not in bei_diff.columns:
+        continue
+
+    s = bei_diff[col].dropna()
+
+    plt.figure(figsize=(10,4))
+    plt.plot(s.index, s*10000, linewidth=2)
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.title(f"BEI gap (Q - P) in bp: {m} months")
+    plt.ylabel("bp")
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# Separate IRP and LP inside BEI
+# ============================================================
+
+liq_idx = state_factors.index("Liquidity_MA3")
+
+common = sorted(set(yhat_Q.columns)
+                .intersection(yhatR_Q.columns)
+                .intersection(yhat_P.columns)
+                .intersection(yhatR_P.columns))
+
+# --- BEI under Q and P
+bei_Q = yhat_Q[common] - yhatR_Q[common]
+bei_P = yhat_P[common] - yhatR_P[common]
+
+# --- Liquidity components (NO helper functions)
+liq_nom_Q  = pd.DataFrame(index=yhat_Q.index)
+liq_real_Q = pd.DataFrame(index=yhatR_Q.index)
+liq_nom_P  = pd.DataFrame(index=yhat_P.index)
+liq_real_P = pd.DataFrame(index=yhatR_P.index)
+
+for n in nom_months:
+    col = f"y_{n}m"
+    if col in common:
+        tau = n / 12.0
+        liq_nom_Q[col] = -(B_nom_Q[n][liq_idx] * Xpr_nom_Q.iloc[:, liq_idx].values) / tau
+        liq_nom_P[col] = -(B_nom_P[n][liq_idx] * Xpr_nom_P.iloc[:, liq_idx].values) / tau
+
+for n in real_months:
+    col = f"y_{n}m"
+    if col in common:
+        tau = n / 12.0
+        liq_real_Q[col] = -(B_real_Q[n][liq_idx] * Xpr_real_Q.iloc[:, liq_idx].values) / tau
+        liq_real_P[col] = -(B_real_P[n][liq_idx] * Xpr_real_P.iloc[:, liq_idx].values) / tau
+
+# --- Liquidity-adjusted BEI
+bei_Q_adj = (yhat_Q[common] - liq_nom_Q[common]) - (yhatR_Q[common] - liq_real_Q[common])
+bei_P_adj = (yhat_P[common] - liq_nom_P[common]) - (yhatR_P[common] - liq_real_P[common])
+
+# --- Decomposition
+LP  = bei_Q - bei_Q_adj
+IRP = bei_Q_adj - bei_P_adj
+
+plot_mats = [24, 60, 120]
+
+for m in plot_mats:
+    col = f"y_{m}m"
+    if col not in common:
+        continue
+
+    s_irp = IRP[col].dropna()
+    s_lp  = LP[col].dropna()
+
+    idx = s_irp.index.intersection(s_lp.index)
+    s_irp = s_irp.loc[idx]
+    s_lp  = s_lp.loc[idx]
+
+    plt.figure(figsize=(10,4))
+    plt.plot(idx, s_irp*10000, label="Inflation Risk Premium", linewidth=2)
+    plt.plot(idx, s_lp*10000, label="Liquidity Premium", linewidth=2)
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.title(f"IRP and LP (bp): {m} months")
+    plt.ylabel("bp")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+for n in [24,60,120]:
+    print(n, B_nom_Q[n][liq_idx], B_real_Q[n][liq_idx])
+plt.plot(Xpr_nom_Q.iloc[:, liq_idx])
+plt.title("Liquidity factor")
+plt.show()
