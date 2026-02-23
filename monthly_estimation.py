@@ -386,7 +386,7 @@ print("mu_tilde_gls shape:", mu_tilde_gls.shape)
 print("mu_tilde_gls:", mu_tilde_gls)
 
 # ============================================================
-# 13) pi0, pi1 via LS on real-bond 1m excess returns (tight version)
+# 13) pi0, pi1 via LS on real-bond 1m excess returns 
 # ============================================================
 
 # --- Fixed inputs from earlier steps
@@ -519,11 +519,6 @@ def residuals_pi(params):
 
     return res.ravel()
 
-# quick sanity: should NOT be flat
-eps = 1e-4
-print("SSE(x0):", np.sum(residuals_pi(x0)**2))
-print("SSE(pi0+eps):", np.sum(residuals_pi(x0 + np.r_[eps, np.zeros(K)])**2))
-
 res = least_squares(
     residuals_pi,
     x0,
@@ -543,6 +538,84 @@ print("success:", res.success, "|", res.message)
 print("pi0_hat:", pi0_hat)
 print("pi1_hat:", pi1_hat)
 print("SSE (scaled):", float(np.sum(res.fun**2)))
+
+# ============================================================
+# Plot estimated inflation vs observed monthly inflation
+# (uses your pi0_hat, pi1_hat, mu_tilde_gls, phi_gls, Sigma, delta0_m, delta1_m, df_model_data)
+# ============================================================
+
+# ----------------------------
+# (1) Inflation: model vs observed
+# ----------------------------
+X_pi_df = df_model_data[state_factors].astype(float)
+pi_hat_1m = pd.Series(pi0_hat + X_pi_df.to_numpy() @ pi1_hat, index=X_pi_df.index, name="pi_hat_1m")
+pi_obs_1m = df_model_data["infl_1m"].astype(float).rename("pi_obs_1m")
+
+tmp_pi = pd.concat([pi_obs_1m, pi_hat_1m], axis=1).dropna()
+
+plt.figure(figsize=(10,4))
+plt.plot(tmp_pi.index, tmp_pi["pi_obs_1m"]*100, linewidth=2, label="Observed inflation (1m)")
+plt.plot(tmp_pi.index, tmp_pi["pi_hat_1m"]*100, linewidth=2, label="Model-implied inflation (1m)")
+plt.axhline(0, linestyle="--", linewidth=1)
+plt.title("Monthly inflation: observed vs model-implied")
+plt.ylabel("Percent")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ----------------------------
+# (2) Real 1m excess returns: model vs observed
+#     (rebuild rx_hat on the SAME aligned sample you used in estimation)
+# ----------------------------
+rx_real_df = rx1m_real.sort_index()
+
+X_t_df   = X_rate_df.reindex(rx_real_df.index)
+X_tp1_df = X_rate_df.shift(-1).reindex(rx_real_df.index)
+
+mask = rx_real_df.notna().all(1) & X_t_df.notna().all(1) & X_tp1_df.notna().all(1)
+
+rx_real_df = rx_real_df.loc[mask]
+X_t_df     = X_t_df.loc[mask]
+X_tp1_df   = X_tp1_df.loc[mask]
+r_t_vec    = r_1m.reindex(rx_real_df.index).to_numpy()
+
+rx_real = rx_real_df.to_numpy(float)      # (T, NR)
+X_t     = X_t_df.to_numpy(float)          # (T, K)
+X_tp1   = X_tp1_df.to_numpy(float)        # (T, K)
+
+real_maturities = REAL_RET_MONTHS_FULLYEARS
+max_n = int(np.max(real_maturities))
+K = len(state_factors)
+
+# Recompute A,B using estimated pi0_hat/pi1_hat
+A = np.zeros(max_n + 1, float)
+B = np.zeros((max_n + 1, K), float)
+delta0_R = delta0_m - pi0_hat
+
+for n in range(1, max_n + 1):
+    B_pi_prev = B[n-1] + pi1_hat
+    B[n] = Phi_tilde_use.T @ B_pi_prev - delta1_m
+    A[n] = A[n-1] + B_pi_prev @ mu_tilde_use + 0.5*(B_pi_prev @ Sigma_use @ B_pi_prev) - delta0_R
+
+# Predicted rx_hat (T, NR)
+rx_hat = np.empty_like(rx_real)
+for j, n in enumerate(real_maturities):
+    rx_hat[:, j] = (A[n-1] + X_tp1 @ B[n-1]) - (A[n] + X_t @ B[n]) - r_t_vec
+
+# Errors in DECIMALS
+err = rx_real - rx_hat
+err_df = pd.DataFrame(err, index=rx_real_df.index, columns=[f"{int(n)}m" for n in real_maturities])
+
+# Plot all maturities on one plot
+plt.figure(figsize=(11,5))
+for c in err_df.columns:
+    plt.plot(err_df.index, err_df[c], linewidth=1, alpha=0.8)
+
+plt.axhline(0, linestyle="--", linewidth=1)
+plt.title("Real bond 1m excess return errors (Observed - Model)")
+plt.ylabel("Decimal return")
+plt.tight_layout()
+plt.show()
 
 # ============================================================
 # INITIAL VALUES Double check 
@@ -646,9 +719,9 @@ A_real_Q, B_real_Q = AB_real(Phi_Q, mu_Q, Sigma_Q, delta0, delta1, pi0, pi1, max
 yhat_Q,  Xpr_nom_Q  = yhat_from_AB(A_nom_Q,  B_nom_Q,  df_nom_y.index,  nom_months)
 yhatR_Q, Xpr_real_Q = yhat_from_AB(A_real_Q, B_real_Q, df_real_y.index, real_months)
 
+# Observed yields aligned to model indices
+yobs_Q  = df_nom_y.reindex(yhat_Q.index)[yhat_Q.columns]
 yobsR_Q = df_real_y.reindex(yhatR_Q.index)[yhatR_Q.columns]
-rmseR_Q = float(np.sqrt(np.nanmean((yhatR_Q - yobsR_Q).to_numpy()**2)))
-print("Real fit RMSE (bp):", rmseR_Q * 10000)
 
 # ============================================================
 # P measure objects (physical): Phi, mu_x
@@ -666,15 +739,17 @@ yhatR_P, Xpr_real_P = yhat_from_AB(A_real_P, B_real_P, df_real_y.index, real_mon
 # ============================================================
 # 15b) Quick plots: model vs observed (Q only)
 # ============================================================
+# Nominal fit plot
 for m in [12, 60, 120]:
     col = f"y_{m}m"
     if col in yobs_Q.columns:
         plt.figure(figsize=(10,4))
-        plt.plot(yobs_Q.index, yobs_Q[col], label="Observed", linewidth=2)
-        plt.plot(yhat_Q.index, yhat_Q[col], label="Model (Q)", linewidth=2)
+        plt.plot(yobs_Q.index,  yobs_Q[col],  label="Observed", linewidth=2)
+        plt.plot(yhat_Q.index,  yhat_Q[col],  label="Model (Q)", linewidth=2)
         plt.title(f"Nominal Yield Fit (Q): {m} months")
         plt.legend(); plt.tight_layout(); plt.show()
 
+# Real fit plot
 for m in [24, 60, 120]:
     col = f"y_{m}m"
     if col in yobsR_Q.columns:
