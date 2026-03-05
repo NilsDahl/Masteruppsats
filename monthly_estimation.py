@@ -7,9 +7,8 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from scipy.optimize import minimize
 from scipy.optimize import least_squares
 
-# ============================================================
-# Helper: robust date parsing for Excel sheets
-# ============================================================
+# Helpers: handling of Excel sheets
+
 def read_excel_date_index(path, sheet_name=0, date_col="date"):
     """
     Read an Excel sheet and return a DataFrame with a clean DatetimeIndex.
@@ -28,20 +27,16 @@ def read_excel_date_index(path, sheet_name=0, date_col="date"):
     df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
     return df
 
-
 def month_cols(df):
     """Return columns like y_6m, y_120m."""
     return [c for c in df.columns if isinstance(c, str) and c.startswith("y_") and c.endswith("m")]
-
 
 def col_to_m(c):
     """Convert column name y_24m -> 24."""
     return int(c.split("_")[1][:-1])
 
+# User inputs
 
-# ============================================================
-# 0) User inputs
-# ============================================================
 factors_path = "model_factors_nominal_real_liquidity.xlsx"
 macro_path   = "CPI_and_rate.xlsx"
 
@@ -56,9 +51,9 @@ state_factors = [
 NOM_RET_MONTHS_FULLYEARS = np.arange(12, 121, 12)   # 24, 36, ..., 120
 REAL_RET_MONTHS_FULLYEARS = np.arange(24, 121, 12)  # 36, 48, ..., 120
 
-# ============================================================
-# 1) Load factors + macro (inflation + short rate) and build dataset
-# ============================================================
+
+# Load factors + inflation + short rate and build dataset
+
 df_f = read_excel_date_index(factors_path, sheet_name=0)
 
 df_inf = (
@@ -66,7 +61,7 @@ df_inf = (
     .rename(columns={"monthly log": "inflation"})
 )
 
-# Short rate from CPI_and_rate.xlsx, sheet "rate" (NOT in decimals per your note)
+# Short rate from CPI_and_rate.xlsx, sheet "rate")
 df_r = (
     read_excel_date_index("short_rate.xlsx", sheet_name=0)  
     .rename(columns={"y_1m": "short_rate"})
@@ -78,32 +73,23 @@ df_r = df_r[["short_rate_dec"]]
 df_model_data = df_f.join([df_inf, df_r], how="inner").sort_index()
 
 X = df_model_data[state_factors].astype(float)
-X_mean = X.mean()
-X_std  = X.std(ddof=0).replace(0, 1.0)     #### demean and scale to unit variance (prevents scaling issues in regression and optimization)
-df_model_data[state_factors] = (X - X_mean) / X_std
-
-print("CHECK means:\n", df_model_data[state_factors].mean())
-print("CHECK stds:\n", df_model_data[state_factors].std(ddof=0))
 
 # Keep required columns
 keep_cols = df_f.columns.tolist() + ["inflation", "short_rate_dec"]
 df_model_data = df_model_data[keep_cols].copy()
 
-# Convert inflation from percent to decimals
+# Convert inflation from percent to decimals and shift to align with rx_{t->t+1}
 infl_m = df_model_data["inflation"] / 100.0
-
-# One-month inflation aligned with rx_{t->t+1}
 df_model_data["infl_1m"] = infl_m.shift(-1)
 
-# ============================================================
-# 2) Load month-grid yields (nominal + real), convert % -> decimals
-# ============================================================
+
+# Load month-grid yields (nominal + real), convert % -> decimals
+
 df_nom_y = read_excel_date_index(nominal_zc_monthgrid_path, sheet_name=0) / 100.0
 df_real_y = read_excel_date_index(real_zc_monthgrid_path, sheet_name=0) / 100.0
 
-# ============================================================
-# 3) Build log prices from month-grid yields
-# ============================================================
+# Build log prices from month-grid yields
+
 def build_logP_from_yield_monthgrid(df_y):
     """
     Build log prices from annualized yields (decimals):
@@ -122,9 +108,8 @@ def build_logP_from_yield_monthgrid(df_y):
 df_logP_nom = build_logP_from_yield_monthgrid(df_nom_y)
 df_logP_real = build_logP_from_yield_monthgrid(df_real_y)
 
-# ============================================================
-# 4) One-month excess returns rx_{t->t+1} using short rate
-# ============================================================
+# One-month excess returns rx_{t->t+1} using short rate
+
 def rx1m_from_logP(logP_df: pd.DataFrame, short_rate_dec: pd.Series, ret_months: np.ndarray):
     """
     rx_{t->t+1}(n) = logP_{t+1}(n-1) - logP_t(n) - r_t
@@ -154,9 +139,9 @@ rx1m_real_stacked.columns = [f"real_{int(c)}m" for c in rx1m_real_stacked.column
 
 rx1m_stacked = rx1m_nom_stacked.join(rx1m_real_stacked, how="inner").sort_index()
 
-# ============================================================
-# 5) VAR(1) on state vector X_t (monthly)
-# ============================================================
+
+# VAR(1) on state vector X_t (monthly)
+
 X_var = df_model_data[state_factors].dropna().copy()
 var_res = VAR(X_var).fit(1)
 
@@ -169,10 +154,9 @@ mu_x = np.linalg.solve(np.eye(K) - Phi, mu)
 
 print(var_res.summary())
 
-# ============================================================
-# 6) OLS regression of short rate on state vector X_t 
+# OLS regression of short rate on state vector X_t 
 #     short_rate_dec(t) = delta0 + delta1' X_t + error
-# ============================================================
+
 df_rate_reg = (
     df_model_data[["short_rate_dec"]]
     .join(df_model_data[state_factors], how="inner")
@@ -190,10 +174,9 @@ delta1 = ols_rate.params[state_factors]
 
 print(ols_rate.summary())
 
-# ============================================================
-# 7) Equation (28)-style stacked regression (monthly one-step)
+# Equation (28) from Abrahams style stacked regression (monthly one-step)
 #     Regress on X_t and X_{t+1}
-# ============================================================
+
 df = df_model_data.join(rx1m_stacked, how="inner").sort_index()
 
 ret_cols = rx1m_stacked.columns.tolist()
@@ -237,9 +220,8 @@ x_now_cols  = state_cols
 x_lead_cols = [c + "_lead1" for c in state_cols]
 x_cols = x_now_cols + x_lead_cols
 
-# ============================================================
-# 8) Run separate OLS per asset
-# ============================================================
+# Run separate OLS per asset
+
 params_list = []
 resid_list = []
 
@@ -287,11 +269,10 @@ ridge = max(1e-10, 1e-6 * np.max(eigvals))   # you can tune 1e-6 -> 1e-4 if need
 Sigma_e_ridge = Sigma_e_hat + ridge * np.eye(Sigma_e_hat.shape[0])
 W = np.linalg.inv(Sigma_e_ridge)  # now safe
 
-# ============================================================
-# 9) Recover Phi_tilde via GLS identity (Abrahams-style)
+
+# Recover Phi_tilde via GLS identity (Abrahams-style)
 #     coeff_now  = -B * Phi_tilde
 #     coeff_lead =  B
-# ============================================================
 
 B_ols = params_df[x_lead_cols].to_numpy(dtype=float)      # (N, K)
 coeff_now = params_df[x_now_cols].to_numpy(dtype=float)   # (N, K)
@@ -300,7 +281,7 @@ Bphi_target = -coeff_now                                   # (N, K)
 lhs = B_ols.T @ W @ B_ols
 rhs = B_ols.T @ W @ Bphi_target
 
-# Ridge on lhs if needed
+# Ridge on lhs to ensure invertibility (can tune 1e-10 -> 1e-8 if needed)
 ridge_lhs = 1e-10 * np.trace(lhs) / lhs.shape[0]
 phi_gls = np.linalg.solve(lhs + ridge_lhs*np.eye(lhs.shape[0]), rhs)
 
@@ -308,9 +289,8 @@ eig = np.linalg.eigvals(phi_gls)
 print("cond(lhs):", np.linalg.cond(lhs))
 print("max |eig(phi_gls)|:", np.max(np.abs(eig)))
 
-# ============================================================
-# 10) Quick residual plot
-# ============================================================
+
+# Quick residual plot
 plt.figure(figsize=(10, 4))
 if E_hat.shape[1] > 0:
     some_asset = E_hat.columns[0]
@@ -321,11 +301,10 @@ if E_hat.shape[1] > 0:
 else:
     print("No residual series to plot.")
 
-# ============================================================
-# 11) Recover α_gls and B_gls via "SUR" on [1, Z_t]
-#     Model: R_pi,t = α + B Z_t + e_t
-# ============================================================
-# 11.0 Build Y panel first to define return dates
+# Recover α_gls and B_gls via "SUR" on [1, Z_t]
+#     Model: R_pi,t = α + B Z_t + e_t 
+
+# Build Y panel first to define return dates
 Rpi_wide = (
     df_ols_long.pivot(index="date", columns="asset", values="R_pi")
     .sort_index()
@@ -334,7 +313,7 @@ Rpi_wide = (
 Rpi_wide.index = pd.to_datetime(Rpi_wide.index)
 ret_dates = Rpi_wide.index
 
-# 11.1 Define X_t and X_{t+1}, aligned to return dates
+# Define X_t and X_{t+1}, aligned to return dates
 X_minus = df_model_data[state_factors].reindex(ret_dates)              # X_t
 X_now   = df_model_data[state_factors].shift(-1).reindex(ret_dates)    # X_{t+1} aligned to t
 
@@ -348,7 +327,7 @@ Z = X_now.to_numpy() - X_minus.to_numpy() @ phi_gls.T
 X_sur = np.column_stack([np.ones(Z.shape[0]), Z])
 z_dates = X_minus.index
 
-# 11.2 Align Y to z_dates and enforce complete panel across assets
+# Align Y to z_dates and enforce complete panel across assets
 Rpi_wide = Rpi_wide.reindex(z_dates)
 
 mask_y = Rpi_wide.notna().all(axis=1).to_numpy()
@@ -360,21 +339,19 @@ K = len(state_factors)
 
 print("SUR design X_sur:", X_sur.shape, "Y:", Y.shape)
 
-# 11.3 Multivariate OLS
+# Multivariate OLS
 C_hat = np.linalg.solve(X_sur.T @ X_sur, X_sur.T @ Y)
 
 alpha_gls = C_hat[0, :]
 B_gls     = C_hat[1:, :].T
 
-# ============================================================
-# 12) Recover mu_tilde_gls via Eq. (30) using alpha_gls, B_gls, Sigma_e_hat, and Sigma_hat
-# ============================================================
+# 12) Recover mu_tilde_gls via Eq. (30) from Abrahams using alpha_gls, B_gls, Sigma_e_hat, and Sigma_hat
 
-# 1) Build gamma_hat_gls (Eq. 27): gamma_i = b_i' Σ b_i for each row b_i of B_gls
+# Build gamma_hat_gls (Eq. 27): gamma_i = b_i' Σ b_i for each row b_i of B_gls
 #    Result shape (N,)
 gamma_hat_gls = np.einsum("ik,kl,il->i", B_gls, Sigma, B_gls)
 
-# 2) Form RHS vector (alpha + 1/2 gamma), shape (N,)
+# Form RHS vector (alpha + 1/2 gamma), shape (N,)
 rhs = alpha_gls + 0.5 * gamma_hat_gls
 
 M = B_gls.T @ W @ B_gls          # (K, K)
@@ -385,11 +362,9 @@ mu_tilde_gls = -np.linalg.solve(M, v)      # (K,)
 print("mu_tilde_gls shape:", mu_tilde_gls.shape)
 print("mu_tilde_gls:", mu_tilde_gls)
 
-# ============================================================
-# 13) pi0, pi1 via LS on real-bond 1m excess returns 
-# ============================================================
+# pi0, pi1 via LS on real-bond 1m excess returns 
 
-# --- Fixed inputs from earlier steps
+# Fixed inputs from earlier steps
 mu_tilde_use  = mu_tilde_gls
 Sigma_use     = Sigma
 Phi_tilde_use = phi_gls
@@ -397,23 +372,12 @@ Phi_tilde_use = phi_gls
 # short rate must be 1-month, same units as rx/logP (monthly decimal)
 r_1m = df_model_data["short_rate_dec"].astype(float)
 
-# ============================================================
-# 13.1 delta0_m, delta1_m from r_t = delta0 + delta1' X_t
-# ============================================================
-X_rate_df = df_model_data[state_factors].astype(float)
-rate_df = X_rate_df.join(r_1m.rename("r_1m"), how="inner").dropna()
 
-X_rate = sm.add_constant(rate_df[state_factors].to_numpy(), has_constant="add")
-y_rate = rate_df["r_1m"].to_numpy()
-b_rate = np.linalg.lstsq(X_rate, y_rate, rcond=None)[0]
+# delta0_m, delta1_m from r_t = delta0 + delta1' X_t
+delta0_m = delta0 
+delta1_m = delta1
 
-delta0_m = float(b_rate[0])
-delta1_m = b_rate[1:].astype(float)
-print("delta0_m:", delta0_m)
-
-# ============================================================
 # 13.2 Align (rx_real, X_t, X_{t+1}, r_t) on the SAME t-index
-# ============================================================
 rx_real_df = rx1m_real.sort_index()
 
 X_t_df   = X_rate_df.reindex(rx_real_df.index)
@@ -438,9 +402,9 @@ max_n = int(np.max(real_maturities))
 
 print("Aligned shapes:", rx_real.shape, X_t.shape, X_tp1.shape, r_t.shape)
 
-# ============================================================
-# 13.3 Start values from inflation regression (can keep this)
-# ============================================================
+
+# Start values from inflation regression 
+
 tmp = df_model_data[["infl_1m"] + state_factors].dropna()
 X_pi = sm.add_constant(tmp[state_factors].to_numpy(float), has_constant="add")
 y_pi = tmp["infl_1m"].to_numpy(float)
@@ -448,9 +412,8 @@ b_pi = np.linalg.lstsq(X_pi, y_pi, rcond=None)[0]
 
 x0 = np.r_[float(b_pi[0]), b_pi[1:].astype(float)]
 
-# ============================================================
-# 13.4 Bounds + clip x0 into bounds
-# ============================================================
+# Bounds + clip x0 into bounds
+
 pi0_lo, pi0_hi = -0.20, 0.20
 pi1_lo, pi1_hi = -1.0,  1.0
 
@@ -460,9 +423,8 @@ x0 = np.minimum(np.maximum(x0, lb + 1e-12), ub - 1e-12)
 
 print("x0:", x0)
 
-# ============================================================
-# 13.5 Recursions + residuals (no heavy debug, just safe penalties)
-# ============================================================
+# Recursions + residuals 
+
 rx_std = np.std(rx_real, axis=0, ddof=0)
 rx_std[~np.isfinite(rx_std)] = 1.0
 rx_std[rx_std == 0] = 1.0
@@ -539,14 +501,11 @@ print("pi0_hat:", pi0_hat)
 print("pi1_hat:", pi1_hat)
 print("SSE (scaled):", float(np.sum(res.fun**2)))
 
-# ============================================================
 # Plot estimated inflation vs observed monthly inflation
-# (uses your pi0_hat, pi1_hat, mu_tilde_gls, phi_gls, Sigma, delta0_m, delta1_m, df_model_data)
-# ============================================================
+# (uses pi0_hat, pi1_hat, mu_tilde_gls, phi_gls, Sigma, delta0_m, delta1_m, df_model_data)
 
-# ----------------------------
-# (1) Inflation: model vs observed
-# ----------------------------
+# Inflation: model vs observed
+
 X_pi_df = df_model_data[state_factors].astype(float)
 pi_hat_1m = pd.Series(pi0_hat + X_pi_df.to_numpy() @ pi1_hat, index=X_pi_df.index, name="pi_hat_1m")
 pi_obs_1m = df_model_data["infl_1m"].astype(float).rename("pi_obs_1m")
@@ -563,10 +522,9 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-# ----------------------------
-# (2) Real 1m excess returns: model vs observed
+# Real 1m excess returns: model vs observed
 #     (rebuild rx_hat on the SAME aligned sample you used in estimation)
-# ----------------------------
+
 rx_real_df = rx1m_real.sort_index()
 
 X_t_df   = X_rate_df.reindex(rx_real_df.index)
@@ -617,9 +575,7 @@ plt.ylabel("Decimal return")
 plt.tight_layout()
 plt.show()
 
-# ============================================================
 # INITIAL VALUES Double check 
-# ============================================================
 
 Phi_init   = Phi.copy()                # VAR(1) transition matrix
 mu_init    = mu.copy()                 # VAR intercept
@@ -655,28 +611,25 @@ pi1_init = pi1_hat
 print("pi0_init:", pi0_init)
 print("pi1_init shape:", pi1_init.shape)
 
-# ============================================================
-# 15) Price yields under Q and P + BEI decomposition (liq-adj)
+# Price yields under Q and P + BEI decomposition (liq-adj)
 # Requires already defined: df_model_data, df_nom_y, df_real_y, state_factors,
 # Phi, mu_x, Sigma, phi_gls, mu_tilde_gls, delta0_m, delta1_m, pi0_hat, pi1_hat
-# ============================================================
 
-# --- maturities
+# maturities
 nom_months  = np.array(sorted([col_to_m(c) for c in month_cols(df_nom_y)]), dtype=int)
 real_months = np.array(sorted([col_to_m(c) for c in month_cols(df_real_y)]), dtype=int)
 max_n = int(max(nom_months.max(), real_months.max()))
 K = len(state_factors)
 liq_idx = state_factors.index("Liquidity_MA3")
 
-# --- shared rate/inflation parameters (monthly)
+# shared rate/inflation parameters (monthly)
 delta0 = float(delta0_m)
 delta1 = delta1_m.astype(float)
 pi0 = float(pi0_hat)
 pi1 = pi1_hat.astype(float)
 
-# ============================================================
 # Helpers: AB recursions + yield builder + liquidity component
-# ============================================================
+
 def AB_nominal(Phi_dyn, mu_dyn, Sigma, delta0, delta1, max_n):
     A = np.zeros(max_n + 1, float)
     B = np.zeros((max_n + 1, K), float)
@@ -706,9 +659,8 @@ def yhat_from_AB(A, B, X_index, months):
         out[f"y_{n}m"] = -(A[n] + X @ B[n]) / tau
     return out, X_pr
 
-# ============================================================
 # Q measure objects (risk-neutral): Phi_tilde, mu_tilde
-# ============================================================
+
 Phi_Q = phi_gls
 mu_Q  = mu_tilde_gls
 Sigma_Q = Sigma
@@ -723,9 +675,9 @@ yhatR_Q, Xpr_real_Q = yhat_from_AB(A_real_Q, B_real_Q, df_real_y.index, real_mon
 yobs_Q  = df_nom_y.reindex(yhat_Q.index)[yhat_Q.columns]
 yobsR_Q = df_real_y.reindex(yhatR_Q.index)[yhatR_Q.columns]
 
-# ============================================================
+
 # P measure objects (physical): Phi, mu_x
-# ============================================================
+
 Phi_P = Phi
 mu_P  = mu
 Sigma_P = Sigma
@@ -736,9 +688,9 @@ A_real_P, B_real_P = AB_real(Phi_P, mu_P, Sigma_P, delta0, delta1, pi0, pi1, max
 yhat_P,  Xpr_nom_P  = yhat_from_AB(A_nom_P,  B_nom_P,  df_nom_y.index,  nom_months)
 yhatR_P, Xpr_real_P = yhat_from_AB(A_real_P, B_real_P, df_real_y.index, real_months)
 
-# ============================================================
+
 # 15b) Quick plots: model vs observed (Q only)
-# ============================================================
+
 # Nominal fit plot
 for m in [12, 60, 120]:
     col = f"y_{m}m"
@@ -759,9 +711,7 @@ for m in [24, 60, 120]:
         plt.title(f"Real Yield Fit (Q): {m} months")
         plt.legend(); plt.tight_layout(); plt.show()
 
-# ============================================================
-# 16) BEI decomposition: BEI difference: Q - P (bp)
-# ============================================================
+# BEI decomposition: BEI difference: Q - P (bp)
 common = sorted(set(yhat_Q.columns).intersection(yhatR_Q.columns).intersection(yhat_P.columns).intersection(yhatR_P.columns))
 
 bei_Q = yhat_Q[common] - yhatR_Q[common]
@@ -785,9 +735,7 @@ for m in plot_mats:
     plt.tight_layout()
     plt.show()
 
-# ============================================================
 # Separate IRP and LP inside BEI
-# ============================================================
 
 liq_idx = state_factors.index("Liquidity_MA3")
 
@@ -796,11 +744,11 @@ common = sorted(set(yhat_Q.columns)
                 .intersection(yhat_P.columns)
                 .intersection(yhatR_P.columns))
 
-# --- BEI under Q and P
+# BEI under Q and P
 bei_Q = yhat_Q[common] - yhatR_Q[common]
 bei_P = yhat_P[common] - yhatR_P[common]
 
-# --- Liquidity components (NO helper functions)
+# Liquidity components (NO helper functions)
 liq_nom_Q  = pd.DataFrame(index=yhat_Q.index)
 liq_real_Q = pd.DataFrame(index=yhatR_Q.index)
 liq_nom_P  = pd.DataFrame(index=yhat_P.index)
@@ -820,11 +768,11 @@ for n in real_months:
         liq_real_Q[col] = -(B_real_Q[n][liq_idx] * Xpr_real_Q.iloc[:, liq_idx].values) / tau
         liq_real_P[col] = -(B_real_P[n][liq_idx] * Xpr_real_P.iloc[:, liq_idx].values) / tau
 
-# --- Liquidity-adjusted BEI
+# Liquidity-adjusted BEI
 bei_Q_adj = (yhat_Q[common] - liq_nom_Q[common]) - (yhatR_Q[common] - liq_real_Q[common])
 bei_P_adj = (yhat_P[common] - liq_nom_P[common]) - (yhatR_P[common] - liq_real_P[common])
 
-# --- Decomposition
+# Decomposition
 LP  = bei_Q - bei_Q_adj
 IRP = bei_Q_adj - bei_P_adj
 
