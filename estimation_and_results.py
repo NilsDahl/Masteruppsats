@@ -38,6 +38,7 @@ def col_to_m(c):
 # User inputs
 
 factors_path = "model_factors_nominal_real_liquidity.xlsx"
+macro_path   = "CPI_and_rate.xlsx"
 
 nominal_zc_monthgrid_path = "nominal_eom_zero_coupon_yields_monthly_grid.xlsx"
 real_zc_monthgrid_path    = "real_eom_zero_coupon_yields_monthly_grid.xlsx"
@@ -47,15 +48,16 @@ state_factors = [
     "Liquidity_MA3", "Real_PC1", "Real_PC2"
 ]
 
-NOM_RET_MONTHS_FULLYEARS = np.arange(12, 121, 12)   # 12, 34, ..., 120
-REAL_RET_MONTHS_FULLYEARS = np.arange(24, 121, 12)  # 24, 36, ..., 120
+NOM_RET_MONTHS_FULLYEARS = np.arange(12, 121, 12)   # 24, 36, ..., 120
+REAL_RET_MONTHS_FULLYEARS = np.arange(24, 121, 12)  # 36, 48, ..., 120
+
 
 # Load factors + inflation + short rate and build dataset
 
 df_f = read_excel_date_index(factors_path, sheet_name=0)
 
 df_inf = (
-    read_excel_date_index("CPI_and_rate.xlsx", sheet_name="inflation")
+    read_excel_date_index(macro_path, sheet_name="inflation")
     .rename(columns={"monthly log": "inflation"})
 )
 
@@ -69,6 +71,12 @@ df_r = df_r[["short_rate_dec"]]
 
 # Merge into one aligned panel
 df_model_data = df_f.join([df_inf, df_r], how="inner").sort_index()
+
+X = df_model_data[state_factors].astype(float)
+
+# Keep required columns
+keep_cols = df_f.columns.tolist() + ["inflation", "short_rate_dec"]
+df_model_data = df_model_data[keep_cols].copy()
 
 # Convert inflation from percent to decimals and shift to align with rx_{t->t+1}
 infl_m = df_model_data["inflation"] / 100.0
@@ -342,7 +350,7 @@ mu_tilde_gls = -np.linalg.solve(M, v)      # (K,)
 print("mu_tilde_gls shape:", mu_tilde_gls.shape)
 print("mu_tilde_gls:", mu_tilde_gls)
 
-# pi0, pi1 via Least Squares on real-bond 1m excess returns 
+# pi0, pi1 via OLS on real-bond 1m excess returns 
 
 # Fixed inputs from earlier steps
 mu_tilde_use  = mu_tilde_gls
@@ -454,10 +462,22 @@ print("success:", res.success, "|", res.message)
 print("pi0_hat:", pi0_hat)
 print("pi1_hat:", pi1_hat)
 
+# Code to check final fit and plot results
+A, B = tips_AB(pi0_hat, pi1_hat)
+rx_hat = rx_hat_from_AB(A, B)
+err = rx_real - rx_hat  # (T, NR)
+
+rmse_by_mat = np.sqrt(np.mean(err**2, axis=0))
+rmse_avg = rmse_by_mat.mean()
+
+print("Avg RMSE:", rmse_avg)
+print("RMSE by maturity (first 10):", rmse_by_mat[:10])
 
 # Plot estimated inflation vs observed monthly inflation
 # (uses pi0_hat, pi1_hat, mu_tilde_gls, phi_gls, Sigma, delta0_m, delta1_m, df_model_data)
+
 # Inflation: model vs observed
+
 X_pi_df = df_model_data[state_factors].astype(float)
 pi_hat_1m = pd.Series(pi0_hat + X_pi_df.to_numpy() @ pi1_hat, index=X_pi_df.index, name="pi_hat_1m")
 pi_obs_1m = df_model_data["infl_1m"].astype(float).rename("pi_obs_1m")
@@ -474,12 +494,46 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-# Code to check final fit and plot results
+# Real 1m excess returns: model vs observed
+# (rebuild rx_hat first on the SAME aligned sample you used in estimation)
+
+rx_real_df = rx1m_real.sort_index()
+
+X_t_df   = X_df.reindex(rx_real_df.index)
+X_tp1_df = X_df.shift(-1).reindex(rx_real_df.index)
+
+mask = rx_real_df.notna().all(1) & X_t_df.notna().all(1) & X_tp1_df.notna().all(1)
+
+rx_real_df = rx_real_df.loc[mask]
+X_t_df     = X_t_df.loc[mask]
+X_tp1_df   = X_tp1_df.loc[mask]
+r_t_vec    = r_1m.reindex(rx_real_df.index).to_numpy()
+
+rx_real = rx_real_df.to_numpy(float)      # (T, NR)
+X_t     = X_t_df.to_numpy(float)          # (T, K)
+X_tp1   = X_tp1_df.to_numpy(float)        # (T, K)
+
 real_maturities = REAL_RET_MONTHS_FULLYEARS
+max_n = int(np.max(real_maturities))
 K = len(state_factors)
-A, B = tips_AB(pi0_hat, pi1_hat)
-rx_hat = rx_hat_from_AB(A, B)
-err = rx_real - rx_hat  # (T, NR)
+
+# Recompute A,B using estimated pi0_hat and pi1_hat
+A = np.zeros(max_n + 1, float)
+B = np.zeros((max_n + 1, K), float)
+delta0_R = delta0_m - pi0_hat
+
+for n in range(1, max_n + 1):
+    B_pi_prev = B[n-1] + pi1_hat
+    B[n] = Phi_tilde_use.T @ B_pi_prev - delta1_m
+    A[n] = A[n-1] + B_pi_prev @ mu_tilde_use + 0.5*(B_pi_prev @ Sigma_use @ B_pi_prev) - delta0_R
+
+# Predicted rx_hat (T, NR)
+rx_hat = np.empty_like(rx_real)
+for j, n in enumerate(real_maturities):
+    rx_hat[:, j] = (A[n-1] + X_tp1 @ B[n-1]) - (A[n] + X_t @ B[n]) - r_t_vec
+
+# Errors in DECIMALS
+err = rx_real - rx_hat
 err_df = pd.DataFrame(err, index=rx_real_df.index, columns=[f"{int(n)}m" for n in real_maturities])
 
 # Plot all maturities on one plot
@@ -493,7 +547,42 @@ plt.legend(title="Maturity", ncol=3, fontsize=9)
 plt.tight_layout()
 plt.show()
 
-################------------------####################
+# INITIAL VALUES Double check 
+
+Phi_init   = Phi.copy()                # VAR(1) transition matrix
+mu_init    = mu.copy()                 # VAR intercept
+Sigma_init = Sigma.copy()              # VAR covariance
+
+K = Phi_init.shape[0]
+
+print("Phi_init shape:", Phi_init.shape)
+print("mu_init shape:", mu_init.shape)
+print("Sigma_init shape:", Sigma_init.shape)
+
+delta0_init = float(delta0)
+delta1_init = delta1.to_numpy(dtype=float)
+
+print("delta0_init:", delta0_init)
+print("delta1_init shape:", delta1_init.shape)
+
+Phi_tilde_init = phi_gls.copy()
+print("Phi_tilde_init shape:", Phi_tilde_init.shape)
+
+alpha_init = alpha_gls.copy()
+B_init     = B_gls.copy()
+
+print("alpha_init shape:", alpha_init.shape)
+print("B_init shape:", B_init.shape)
+
+mu_tilde_init = mu_tilde_gls.copy()
+print("mu_tilde_init shape:", mu_tilde_init.shape)
+
+pi0_init = pi0_hat
+pi1_init = pi1_hat
+
+print("pi0_init:", pi0_init)
+print("pi1_init shape:", pi1_init.shape)
+
 # Price yields under Q and P + BEI decomposition (liq-adj)
 # Requires already defined: df_model_data, df_nom_y, df_real_y, state_factors,
 # Phi, mu_x, Sigma, phi_gls, mu_tilde_gls, delta0_m, delta1_m, pi0_hat, pi1_hat
@@ -510,14 +599,14 @@ delta1 = delta1_m.astype(float)
 pi0 = float(pi0_hat)
 pi1 = pi1_hat.astype(float)
 
-# Helpers: AB recursions + yield builder + excess return builder
+# Helpers: AB recursions + yield builder + liquidity component
 
 def AB_nominal(Phi_dyn, mu_dyn, Sigma, delta0, delta1, max_n):
     A = np.zeros(max_n + 1, float)
     B = np.zeros((max_n + 1, K), float)
     for n in range(1, max_n + 1):
         Bn = Phi_dyn.T @ B[n-1] - delta1
-        An = A[n-1] + B[n-1] @ mu_dyn + 0.5 * (B[n-1] @ Sigma @ B[n-1]) - delta0
+        An = A[n-1] + B[n-1] @ mu_dyn + 0.5*(B[n-1] @ Sigma @ B[n-1]) - delta0
         A[n], B[n] = An, Bn
     return A, B
 
@@ -528,43 +617,18 @@ def AB_real(Phi_dyn, mu_dyn, Sigma, delta0, delta1, pi0, pi1, max_n):
     for n in range(1, max_n + 1):
         B_pi_prev = B[n-1] + pi1
         Bn = Phi_dyn.T @ B_pi_prev - delta1
-        An = A[n-1] + B_pi_prev @ mu_dyn + 0.5 * (B_pi_prev @ Sigma @ B_pi_prev) - delta0_R
+        An = A[n-1] + B_pi_prev @ mu_dyn + 0.5*(B_pi_prev @ Sigma @ B_pi_prev) - delta0_R
         A[n], B[n] = An, Bn
     return A, B
 
 def yhat_from_AB(A, B, X_index, months):
     X_pr = df_model_data[state_factors].reindex(X_index).astype(float).dropna()
-    X_arr = X_pr.to_numpy(float)
+    X = X_pr.to_numpy(float)
     out = pd.DataFrame(index=X_pr.index)
     for n in months:
         tau = n / 12.0
-        out[f"y_{n}m"] = -(A[n] + X_arr @ B[n]) / tau
+        out[f"y_{n}m"] = -(A[n] + X @ B[n]) / tau
     return out, X_pr
-
-def rxhat_nominal_from_AB(B, Phi_tilde, mu_tilde, Sigma, X_t_df, X_tp1_df, months):
-    idx = X_t_df.index.intersection(X_tp1_df.index)
-    X_t_arr = X_t_df.reindex(idx).to_numpy(float)
-    X_tp1_arr = X_tp1_df.reindex(idx).to_numpy(float)
-
-    out = pd.DataFrame(index=idx)
-    for n in months:
-        b_prev = B[n - 1]
-        alpha = -(b_prev @ mu_tilde + 0.5 * (b_prev @ Sigma @ b_prev))
-        out[f"rx_{n}m"] = alpha - (X_t_arr @ Phi_tilde.T @ b_prev) + (X_tp1_arr @ b_prev)
-    return out
-
-def rxhat_real_from_AB(B, Phi_tilde, mu_tilde, Sigma, pi0, pi1, X_t_df, X_tp1_df, months):
-    idx = X_t_df.index.intersection(X_tp1_df.index)
-    X_t_arr = X_t_df.reindex(idx).to_numpy(float)
-    X_tp1_arr = X_tp1_df.reindex(idx).to_numpy(float)
-
-    out = pd.DataFrame(index=idx)
-    for n in months:
-        b_prev = B[n - 1]
-        b_pi_prev = b_prev + pi1
-        alpha = -(pi0 + b_pi_prev @ mu_tilde + 0.5 * (b_pi_prev @ Sigma @ b_pi_prev))
-        out[f"rx_{n}m"] = alpha - (X_t_arr @ Phi_tilde.T @ b_pi_prev) + (X_tp1_arr @ b_prev)
-    return out
 
 # Q measure objects (risk-neutral): Phi_tilde, mu_tilde
 
@@ -594,91 +658,28 @@ A_real_P, B_real_P = AB_real(Phi_P, mu_P, Sigma_P, delta0, delta1, pi0, pi1, max
 yhat_P,  Xpr_nom_P  = yhat_from_AB(A_nom_P,  B_nom_P,  df_nom_y.index,  nom_months)
 yhatR_P, Xpr_real_P = yhat_from_AB(A_real_P, B_real_P, df_real_y.index, real_months)
 
-# Build model-implied excess returns under Q
-X_df = df_model_data[state_factors].astype(float).copy()
-X_t_df = X_df.copy()
-X_tp1_df = X_df.shift(-1)
 
-rxhat_nom_Q = rxhat_nominal_from_AB(
-    B=B_nom_Q,
-    Phi_tilde=Phi_Q,
-    mu_tilde=mu_Q,
-    Sigma=Sigma_Q,
-    X_t_df=X_t_df,
-    X_tp1_df=X_tp1_df,
-    months=NOM_RET_MONTHS_FULLYEARS
-)
-rxhat_real_Q = rxhat_real_from_AB(
-    B=B_real_Q,
-    Phi_tilde=Phi_Q,
-    mu_tilde=mu_Q,
-    Sigma=Sigma_Q,
-    pi0=pi0,
-    pi1=pi1,
-    X_t_df=X_t_df,
-    X_tp1_df=X_tp1_df,
-    months=REAL_RET_MONTHS_FULLYEARS
-)
-# Observed excess returns aligned to model-implied series
-rxobs_nom_Q = rx1m_nom.copy()
-rxobs_nom_Q.columns = [f"rx_{int(c)}m" for c in rxobs_nom_Q.columns]
-rxobs_nom_Q = rxobs_nom_Q.reindex(rxhat_nom_Q.index)[rxhat_nom_Q.columns]
-
-rxobs_real_Q = rx1m_real.copy()
-rxobs_real_Q.columns = [f"rx_{int(c)}m" for c in rxobs_real_Q.columns]
-rxobs_real_Q = rxobs_real_Q.reindex(rxhat_real_Q.index)[rxhat_real_Q.columns]
-
-# Quick plots: model vs observed yields
+# Quick plots: model vs observed (Q only)
 
 # Nominal fit plot
 for m in [12, 60, 120]:
     col = f"y_{m}m"
     if col in yobs_Q.columns:
-        plt.figure(figsize=(10, 4))
-        plt.plot(yobs_Q.index, yobs_Q[col], label="Observed", linewidth=2)
-        plt.plot(yhat_Q.index, yhat_Q[col], label="Model", linewidth=2)
-        plt.title(f"Nominal Yield Fit: {m} months")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+        plt.figure(figsize=(10,4))
+        plt.plot(yobs_Q.index,  yobs_Q[col],  label="Observed", linewidth=2)
+        plt.plot(yhat_Q.index,  yhat_Q[col],  label="Model (Q)", linewidth=2)
+        plt.title(f"Nominal Yield Fit (Q): {m} months")
+        plt.legend(); plt.tight_layout(); plt.show()
 
 # Real fit plot
 for m in [24, 60, 120]:
     col = f"y_{m}m"
     if col in yobsR_Q.columns:
-        plt.figure(figsize=(10, 4))
+        plt.figure(figsize=(10,4))
         plt.plot(yobsR_Q.index, yobsR_Q[col], label="Observed real", linewidth=2)
-        plt.plot(yhatR_Q.index, yhatR_Q[col], label="Model", linewidth=2)
-        plt.title(f"Real Yield Fit: {m} months")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-# Quick plots: model vs observed excess returns
-
-# Nominal excess return fit plot
-for m in [12, 60, 120]:
-    col = f"rx_{m}m"
-    if col in rxobs_nom_Q.columns:
-        plt.figure(figsize=(10, 4))
-        plt.plot(rxobs_nom_Q.index, rxobs_nom_Q[col], label="Observed", linewidth=2)
-        plt.plot(rxhat_nom_Q.index, rxhat_nom_Q[col], label="Model", linewidth=2)
-        plt.title(f"Nominal 1m Excess Return Fit: {m} months")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-# Real excess return fit plot
-for m in [24, 60, 120]:
-    col = f"rx_{m}m"
-    if col in rxobs_real_Q.columns:
-        plt.figure(figsize=(10, 4))
-        plt.plot(rxobs_real_Q.index, rxobs_real_Q[col], label="Observed real", linewidth=2)
-        plt.plot(rxhat_real_Q.index, rxhat_real_Q[col], label="Model", linewidth=2)
-        plt.title(f"Real 1m Excess Return Fit: {m} months")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+        plt.plot(yhatR_Q.index, yhatR_Q[col], label="Model real (Q)", linewidth=2)
+        plt.title(f"Real Yield Fit (Q): {m} months")
+        plt.legend(); plt.tight_layout(); plt.show()
 
 # BEI decomposition: BEI difference: Q - P (bp)
 common = sorted(set(yhat_Q.columns).intersection(yhatR_Q.columns).intersection(yhat_P.columns).intersection(yhatR_P.columns))
@@ -707,6 +708,11 @@ for m in plot_mats:
 # Separate IRP and LP inside BEI
 
 liq_idx = state_factors.index("Liquidity_MA3")
+
+common = sorted(set(yhat_Q.columns)
+                .intersection(yhatR_Q.columns)
+                .intersection(yhat_P.columns)
+                .intersection(yhatR_P.columns))
 
 # BEI under Q and P
 bei_Q = yhat_Q[common] - yhatR_Q[common]
