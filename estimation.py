@@ -79,8 +79,20 @@ df_model_data["infl_1m"] = infl_m.shift(-1)
 df_nom_y = read_excel_date_index(nominal_zc_monthgrid_path, sheet_name=0) / 100.0
 df_real_y = read_excel_date_index(real_zc_monthgrid_path, sheet_name=0) / 100.0
 
-# Build log prices from month-grid yields
+# Survey inflation expectations (Swedish Money Market Players, quarterly, %)
+df_survey = pd.read_excel(
+    "CPI_Inflation_Expectations.xlsx",
+    sheet_name="CPI Expectations",
+    header=1
+)
+df_survey["date"] = pd.to_datetime(df_survey["Month"], format="%b-%Y")
+df_survey = (df_survey.drop(columns=["Month"]).set_index("date").sort_index())
+# Convert % to decimals to match model units
+df_survey = df_survey / 100.0
 
+# Helpers for building log prices and excess returns from yields
+
+# Build log prices from month-grid yields
 def build_logP_from_yield_monthgrid(df_y):
     """
     Build log prices from annualized yields (decimals):
@@ -100,7 +112,6 @@ df_logP_nom = build_logP_from_yield_monthgrid(df_nom_y)
 df_logP_real = build_logP_from_yield_monthgrid(df_real_y)
 
 # One-month excess returns rx_{t->t+1} using short rate
-
 def rx1m_from_logP(logP_df: pd.DataFrame, short_rate_dec: pd.Series, ret_months: np.ndarray):
     """
     rx_{t->t+1}(n) = logP_{t+1}(n-1) - logP_t(n) - r_t
@@ -629,90 +640,86 @@ rxobs_real_Q.columns = [f"rx_{int(c)}m" for c in rxobs_real_Q.columns]
 rxobs_real_Q = rxobs_real_Q.reindex(rxhat_real_Q.index)[rxhat_real_Q.columns]
 
 # Quick plots: model vs observed yields
+mat_labels = {12: "1-year", 24: "2-year", 60: "5-year", 120: "10-year"}
 
-# Nominal fit plot
+# Nominal yield fit
 for m in [12, 60, 120]:
     col = f"y_{m}m"
-    if col in yobs_Q.columns:
-        plt.figure(figsize=(10, 4))
-        plt.plot(yobs_Q.index, yobs_Q[col], label="Observed", linewidth=2)
-        plt.plot(yhat_Q.index, yhat_Q[col], label="Model", linewidth=2)
-        plt.title(f"Nominal Yield Fit: {m} months")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-# Real fit plot
-for m in [24, 60, 120]:
-    col = f"y_{m}m"
-    if col in yobsR_Q.columns:
-        plt.figure(figsize=(10, 4))
-        plt.plot(yobsR_Q.index, yobsR_Q[col], label="Observed real", linewidth=2)
-        plt.plot(yhatR_Q.index, yhatR_Q[col], label="Model", linewidth=2)
-        plt.title(f"Real Yield Fit: {m} months")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-# Quick plots: model vs observed excess returns
-
-# Nominal excess return fit plot
-for m in [12, 60, 120]:
-    col = f"rx_{m}m"
-    if col in rxobs_nom_Q.columns:
-        plt.figure(figsize=(10, 4))
-        plt.plot(rxobs_nom_Q.index, rxobs_nom_Q[col], label="Observed", linewidth=2)
-        plt.plot(rxhat_nom_Q.index, rxhat_nom_Q[col], label="Model", linewidth=2)
-        plt.title(f"Nominal 1m Excess Return Fit: {m} months")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-# Real excess return fit plot
-for m in [24, 60, 120]:
-    col = f"rx_{m}m"
-    if col in rxobs_real_Q.columns:
-        plt.figure(figsize=(10, 4))
-        plt.plot(rxobs_real_Q.index, rxobs_real_Q[col], label="Observed real", linewidth=2)
-        plt.plot(rxhat_real_Q.index, rxhat_real_Q[col], label="Model", linewidth=2)
-        plt.title(f"Real 1m Excess Return Fit: {m} months")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-# BEI decomposition: BEI difference: Q - P (bp)
-common = sorted(set(yhat_Q.columns).intersection(yhatR_Q.columns).intersection(yhat_P.columns).intersection(yhatR_P.columns))
-
-bei_Q = yhat_Q[common] - yhatR_Q[common]
-bei_P = yhat_P[common] - yhatR_P[common]
-
-bei_diff = bei_Q - bei_P   # this is the gap (IRP + LP if not liq-adjusted)
-
-plot_mats = [24, 60, 120]
-for m in plot_mats:
-    col = f"y_{m}m"
-    if col not in bei_diff.columns:
+    if col not in yobs_Q.columns:
         continue
-
-    s = bei_diff[col].dropna()
-
-    plt.figure(figsize=(10,4))
-    plt.plot(s.index, s*10000, linewidth=2)
-    plt.axhline(0, linestyle="--", linewidth=1)
-    plt.title(f"BEI gap (Q - P) in bp: {m} months")
-    plt.ylabel("bp")
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(yobs_Q.index,  yobs_Q[col]  * 10_000, label="Observed", linewidth=2)
+    ax.plot(yhat_Q.index,  yhat_Q[col]  * 10_000, label="Model",    linewidth=2)
+    ax.set_title(f"Nominal Yield Fit — {mat_labels[m]}", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Basis points")
+    ax.legend(fontsize=10)
+    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
     plt.tight_layout()
     plt.show()
 
-# Separate IRP and LP inside BEI
+# Real yield fit
+for m in [24, 60, 120]:
+    col = f"y_{m}m"
+    if col not in yobsR_Q.columns:
+        continue
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(yobsR_Q.index, yobsR_Q[col] * 10_000, label="Observed", linewidth=2)
+    ax.plot(yhatR_Q.index, yhatR_Q[col] * 10_000, label="Model",    linewidth=2)
+    ax.set_title(f"Real Yield Fit — {mat_labels[m]}", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Basis points")
+    ax.legend(fontsize=10)
+    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+    plt.tight_layout()
+    plt.show()
 
+# Nominal excess return fit
+for m in [12, 60, 120]:
+    col = f"rx_{m}m"
+    if col not in rxobs_nom_Q.columns:
+        continue
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(rxobs_nom_Q.index, rxobs_nom_Q[col] * 10_000, label="Observed", linewidth=2)
+    ax.plot(rxhat_nom_Q.index, rxhat_nom_Q[col] * 10_000, label="Model",    linewidth=2)
+    ax.set_title(f"Nominal 1m Excess Return Fit — {mat_labels[m]}", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Basis points")
+    ax.legend(fontsize=10)
+    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+# Real excess return fit
+for m in [24, 60, 120]:
+    col = f"rx_{m}m"
+    if col not in rxobs_real_Q.columns:
+        continue
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(rxobs_real_Q.index, rxobs_real_Q[col] * 10_000, label="Observed", linewidth=2)
+    ax.plot(rxhat_real_Q.index, rxhat_real_Q[col] * 10_000, label="Model",    linewidth=2)
+    ax.set_title(f"Real 1m Excess Return Fit — {mat_labels[m]}", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Basis points")
+    ax.legend(fontsize=10)
+    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+
+# ──------- BEI Decomposition ────────────────────────────────────────────────────────
+
+assert state_factors[liq_idx] == "Liquidity_MA3"
 liq_idx = state_factors.index("Liquidity_MA3")
+
+common = sorted(
+    set(yhat_Q.columns)
+    .intersection(yhatR_Q.columns)
+    .intersection(yhat_P.columns)
+    .intersection(yhatR_P.columns)
+)
 
 # BEI under Q and P
 bei_Q = yhat_Q[common] - yhatR_Q[common]
 bei_P = yhat_P[common] - yhatR_P[common]
 
-# Liquidity components 
+# Liquidity components of nominal and real yields
 liq_nom_Q  = pd.DataFrame(index=yhat_Q.index)
 liq_real_Q = pd.DataFrame(index=yhatR_Q.index)
 liq_nom_P  = pd.DataFrame(index=yhat_P.index)
@@ -732,40 +739,113 @@ for n in real_months:
         liq_real_Q[col] = -(B_real_Q[n][liq_idx] * Xpr_real_Q.iloc[:, liq_idx].values) / tau
         liq_real_P[col] = -(B_real_P[n][liq_idx] * Xpr_real_P.iloc[:, liq_idx].values) / tau
 
-# Liquidity-adjusted BEI
+# Liquidity-adjusted BEI (strip out liq component from both nominal and real)
 bei_Q_adj = (yhat_Q[common] - liq_nom_Q[common]) - (yhatR_Q[common] - liq_real_Q[common])
 bei_P_adj = (yhat_P[common] - liq_nom_P[common]) - (yhatR_P[common] - liq_real_P[common])
 
-# Decomposition
-LP  = bei_Q - bei_Q_adj
-IRP = bei_Q_adj - bei_P_adj
+# Decomposition:
+#   BEI         = E^P[π] + IRP + LP
+#   LP          = BEI_Q      - BEI_Q_adj   (liquidity distortion in raw breakeven)
+#   IRP         = BEI_Q_adj  - BEI_P_adj   (Q vs P wedge on liq-adjusted BEI)
+#   E^P[π]      = BEI_P_adj               (liq-adjusted P-measure expected inflation)
+LP      = bei_Q     - bei_Q_adj
+IRP     = bei_Q_adj - bei_P_adj
+E_inf   = bei_P_adj                        # liq-adjusted expected inflation under P
+BEI_obs = bei_Q                            # raw (unadjusted) breakeven = sum of all three
 
-plot_mats = [24, 60, 120]
+# Plots 
+
+plot_mats   = [24, 60, 120]
+mat_labels  = {24: "2-year", 60: "5-year", 120: "10-year"}
+
+colors = {
+    "BEI":   "#2c2c2c",
+    "E_inf": "#e07b39",
+    "IRP":   "#2a6ebb",
+    "LP":    "#3aaa6e",
+}
 
 for m in plot_mats:
     col = f"y_{m}m"
     if col not in common:
         continue
 
-    s_irp = IRP[col].dropna()
-    s_lp  = LP[col].dropna()
+    # Align all series to a common index and convert to bp
+    idx = (
+        BEI_obs[col].dropna().index
+        .intersection(IRP[col].dropna().index)
+        .intersection(LP[col].dropna().index)
+        .intersection(E_inf[col].dropna().index)
+    )
 
-    idx = s_irp.index.intersection(s_lp.index)
-    s_irp = s_irp.loc[idx]
-    s_lp  = s_lp.loc[idx]
+    s_bei   = BEI_obs[col].loc[idx] * 10_000
+    s_irp   = IRP[col].loc[idx]     * 10_000
+    s_lp    = LP[col].loc[idx]      * 10_000
+    s_einf  = E_inf[col].loc[idx]   * 10_000
 
-    plt.figure(figsize=(10,4))
-    plt.plot(idx, s_irp*10000, label="Inflation Risk Premium", linewidth=2)
-    plt.plot(idx, s_lp*10000, label="Liquidity Premium", linewidth=2)
-    plt.axhline(0, linestyle="--", linewidth=1)
-    plt.title(f"IRP and LP (bp): {m} months")
-    plt.ylabel("bp")
-    plt.legend()
+    fig, ax = plt.subplots(figsize=(11, 4))
+
+    ax.plot(idx, s_bei,  color=colors["BEI"],   linewidth=2.0, linestyle="--",
+            label="Breakeven inflation (raw)")
+    ax.plot(idx, s_einf, color=colors["E_inf"], linewidth=2.0,
+            label="Expected inflation ($E^P[\\pi]$)")
+    ax.plot(idx, s_irp,  color=colors["IRP"],   linewidth=2.0,
+            label="Inflation risk premium")
+    ax.plot(idx, s_lp,   color=colors["LP"],    linewidth=2.0,
+            label="Liquidity premium")
+
+    ax.axhline(0, color="black", linestyle=":", linewidth=0.8)
+
+    ax.set_title(
+        f"BEI Decomposition — {mat_labels[m]} maturity ({m}m)",
+        fontsize=13, fontweight="bold"
+    )
+    ax.set_ylabel("Basis points", fontsize=11)
+    ax.set_xlabel("")
+    ax.legend(frameon=True, fontsize=10, loc="upper right", ncol=2)
+    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+    ax.set_axisbelow(True)
+
+    # Sanity check printed below each plot
+    check = (s_einf + s_irp + s_lp - s_bei).abs().max()
+    print(f"{mat_labels[m]}: max decomposition residual = {check:.4f} bp")
+
     plt.tight_layout()
     plt.show()
 
-for n in [24,60,120]:
-    print(n, B_nom_Q[n][liq_idx], B_real_Q[n][liq_idx])
-plt.plot(Xpr_nom_Q.iloc[:, liq_idx])
-plt.title("Liquidity factor")
-plt.show()
+
+# Model-implied expected inflation vs survey — by horizon
+horizon_map = {
+    "2 Year": 24,
+    "5 Year": 60,
+}
+
+for survey_col, m in horizon_map.items():
+    col = f"y_{m}m"
+
+    s_model  = E_inf[col].dropna()    * 10_000
+    s_survey = df_survey[survey_col].dropna() * 10_000
+    s_bei    = BEI_obs[col].dropna()  * 10_000
+
+    fig, ax = plt.subplots(figsize=(11, 4))
+
+    ax.plot(s_bei.index,    s_bei,    color="#2c2c2c", linewidth=1.8,
+            linestyle="--", label="Breakeven inflation (raw)")
+    ax.plot(s_model.index,  s_model,  color="#e07b39", linewidth=2.0,
+            label="Model-implied expected inflation")
+    ax.plot(s_survey.index, s_survey, color="#9b2335", linewidth=1.8,
+            linestyle=(0, (4, 2)), marker="o", markersize=2.5,
+            label="Survey expected inflation")
+
+    ax.axhline(0, color="black", linestyle=":", linewidth=0.8)
+    ax.set_title(
+        f"Expected Inflation: Model vs Survey vs BEI — {survey_col} horizon",
+        fontsize=13, fontweight="bold", pad=10
+    )
+    ax.set_ylabel("Basis points", fontsize=11)
+    ax.legend(frameon=True, fontsize=10)
+    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+    ax.set_axisbelow(True)
+
+    plt.tight_layout()
+    plt.show()
