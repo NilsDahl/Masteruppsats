@@ -11,20 +11,15 @@ from scipy.optimize import least_squares
 
 def read_excel_date_index(path, sheet_name=0, date_col="date"):
     """
-    Read an Excel sheet and return a DataFrame with a clean DatetimeIndex.
-    Steps:
-    1) Read sheet into a DataFrame
-    2) Parse date_col to datetime (coerce errors)
-    3) Drop rows where date cannot be parsed
-    4) Set DatetimeIndex and sort
+    Like read_excel_date_index but normalizes dates to period-month
+    to handle last-trading-day vs calendar-end-of-month mismatches.
     """
     df = pd.read_excel(path, sheet_name=sheet_name)
-
-    if date_col not in df.columns:
-        raise ValueError(f"Missing '{date_col}' column in {path} / sheet={sheet_name}")
-
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    df = df.dropna(subset=[date_col])
+    # Normalize to month-end so SGB and US files always align
+    df[date_col] = df[date_col] + pd.offsets.MonthEnd(0)
+    df = df.set_index(date_col).sort_index()
     return df
 
 def month_cols(df):
@@ -37,14 +32,14 @@ def col_to_m(c):
 
 # User inputs
 
-factors_path = "model_factors_nominal_real_liquidity.xlsx"
+factors_path = "pcas_and_liquidity.xlsx"
 
-nominal_zc_monthgrid_path = "nominal_eom_zero_coupon_yields_monthly_grid.xlsx"
-real_zc_monthgrid_path    = "real_eom_zero_coupon_yields_monthly_grid.xlsx"
+nominal_zc_monthgrid_path = "zero_yields_SGB.xlsx"
+real_zc_monthgrid_path    = "zero_yields_SGBIL.xlsx"
 
 state_factors = [
     "PC1_level", "PC2_slope", "PC3_curvature",
-    "Liquidity_MA3", "Real_PC1", "Real_PC2"
+    "composite_liq", "Real_PC1", "Real_PC2"
 ]
 
 NOM_RET_MONTHS_FULLYEARS = np.arange(12, 121, 12)   # 12, 34, ..., 120
@@ -64,7 +59,7 @@ df_r = (
     read_excel_date_index("short_rate.xlsx", sheet_name=0)  
     .rename(columns={"y_1m": "short_rate"})
 )
-df_r["short_rate_dec"] = df_r["short_rate"] / 100.0 / 12.0   # monthly decimal
+df_r["short_rate_dec"] = df_r["short_rate"] / 12.0   # monthly decimal
 df_r = df_r[["short_rate_dec"]]
 
 # Merge into one aligned panel
@@ -76,8 +71,8 @@ df_model_data["infl_1m"] = infl_m.shift(-1)
 
 # Load month-grid yields (nominal + real), convert % -> decimals
 
-df_nom_y = read_excel_date_index(nominal_zc_monthgrid_path, sheet_name=0) / 100.0
-df_real_y = read_excel_date_index(real_zc_monthgrid_path, sheet_name=0) / 100.0
+df_nom_y = read_excel_date_index(nominal_zc_monthgrid_path, sheet_name=0) 
+df_real_y = read_excel_date_index(real_zc_monthgrid_path, sheet_name=0) 
 
 # Survey inflation expectations (Swedish Money Market Players, quarterly, %)
 df_survey = pd.read_excel(
@@ -642,71 +637,36 @@ rxobs_real_Q = rxobs_real_Q.reindex(rxhat_real_Q.index)[rxhat_real_Q.columns]
 # Quick plots: model vs observed yields
 mat_labels = {12: "1-year", 24: "2-year", 60: "5-year", 120: "10-year"}
 
-# Nominal yield fit
-for m in [12, 60, 120]:
-    col = f"y_{m}m"
-    if col not in yobs_Q.columns:
-        continue
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(yobs_Q.index,  yobs_Q[col]  * 10_000, label="Observed", linewidth=2)
-    ax.plot(yhat_Q.index,  yhat_Q[col]  * 10_000, label="Model",    linewidth=2)
-    ax.set_title(f"Nominal Yield Fit — {mat_labels[m]}", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Basis points")
-    ax.legend(fontsize=10)
-    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+def plot_3panel(mats, obs_df, hat_df, title, prefix):
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    for ax, m in zip(axes, mats):
+        col = f"{prefix}{m}m"
+        if col not in obs_df.columns:
+            ax.set_visible(False)
+            continue
+        ax.plot(obs_df.index, obs_df[col] * 10_000,
+                label="Observed", linewidth=1.8, color="#2a6ebb")
+        ax.plot(hat_df.index, hat_df[col] * 10_000,
+                label="Model",    linewidth=1.8, color="#e07b39")
+        ax.set_title(mat_labels[m], fontsize=11)
+        ax.set_ylabel("Basis points", fontsize=10)
+        ax.legend(fontsize=9, loc="upper right")
+        ax.axhline(0, color="black", lw=0.7, linestyle=":")
+        ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+        ax.set_axisbelow(True)
     plt.tight_layout()
     plt.show()
 
-# Real yield fit
-for m in [24, 60, 120]:
-    col = f"y_{m}m"
-    if col not in yobsR_Q.columns:
-        continue
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(yobsR_Q.index, yobsR_Q[col] * 10_000, label="Observed", linewidth=2)
-    ax.plot(yhatR_Q.index, yhatR_Q[col] * 10_000, label="Model",    linewidth=2)
-    ax.set_title(f"Real Yield Fit — {mat_labels[m]}", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Basis points")
-    ax.legend(fontsize=10)
-    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
-    plt.tight_layout()
-    plt.show()
-
-# Nominal excess return fit
-for m in [12, 60, 120]:
-    col = f"rx_{m}m"
-    if col not in rxobs_nom_Q.columns:
-        continue
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(rxobs_nom_Q.index, rxobs_nom_Q[col] * 10_000, label="Observed", linewidth=2)
-    ax.plot(rxhat_nom_Q.index, rxhat_nom_Q[col] * 10_000, label="Model",    linewidth=2)
-    ax.set_title(f"Nominal 1m Excess Return Fit — {mat_labels[m]}", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Basis points")
-    ax.legend(fontsize=10)
-    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
-    plt.tight_layout()
-    plt.show()
-
-# Real excess return fit
-for m in [24, 60, 120]:
-    col = f"rx_{m}m"
-    if col not in rxobs_real_Q.columns:
-        continue
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(rxobs_real_Q.index, rxobs_real_Q[col] * 10_000, label="Observed", linewidth=2)
-    ax.plot(rxhat_real_Q.index, rxhat_real_Q[col] * 10_000, label="Model",    linewidth=2)
-    ax.set_title(f"Real 1m Excess Return Fit — {mat_labels[m]}", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Basis points")
-    ax.legend(fontsize=10)
-    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
-    plt.tight_layout()
-    plt.show()
+plot_3panel([12, 60, 120], yobs_Q,       yhat_Q,       "Nominal Yield Fit",            "y_")
+plot_3panel([24, 60, 120], yobsR_Q,      yhatR_Q,      "Real Yield Fit",               "y_")
+plot_3panel([12, 60, 120], rxobs_nom_Q,  rxhat_nom_Q,  "Nominal 1m Excess Return Fit", "rx_")
+plot_3panel([24, 60, 120], rxobs_real_Q, rxhat_real_Q, "Real 1m Excess Return Fit",    "rx_")
 
 
 # ──------- BEI Decomposition ────────────────────────────────────────────────────────
-
-assert state_factors[liq_idx] == "Liquidity_MA3"
-liq_idx = state_factors.index("Liquidity_MA3")
+liq_idx = state_factors.index("composite_liq")
+assert state_factors[liq_idx] == "composite_liq"
 
 common = sorted(
     set(yhat_Q.columns)
