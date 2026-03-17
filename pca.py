@@ -15,14 +15,17 @@ REAL_PATH    = "zero_yields_SGBIL.xlsx"
 TURN_PATH    = "turnover_monthly_with_liquidity.xlsx"
 
 OUT_NOMINAL  = "nominal_pcs_5m_120m.xlsx"
-OUT_FACTORS  = "model_factors_nominal_real_liquidity.xlsx"
+OUT_FACTORS  = "pcas_and_liquidity.xlsx"
 
 
 
 # 1) Load data
 
 nom = pd.read_excel(NOMINAL_PATH, parse_dates=["date"]).sort_values("date").set_index("date")
+nom.index = nom.index + pd.offsets.MonthEnd(0)
+
 real = pd.read_excel(REAL_PATH, parse_dates=["date"]).sort_values("date").set_index("date")
+real.index = real.index + pd.offsets.MonthEnd(0)
 
 turnover = pd.read_excel(
     TURN_PATH,
@@ -123,7 +126,7 @@ turnover = turnover.loc[common2]
 X = pd.concat(
     [
         nominal_pcs[["PC1_level", "PC2_slope", "PC3_curvature"]],
-        turnover[["liquidity_ma3"]],
+        turnover[["composite_liq"]],
     ],
     axis=1
 ).dropna()
@@ -171,7 +174,7 @@ plt.show()
 factors_df = pd.concat(
     [
         nominal_pcs[["PC1_level", "PC2_slope", "PC3_curvature"]],
-        turnover[["liquidity_ma3"]].rename(columns={"liquidity_ma3": "Liquidity_MA3"}),
+        turnover[["composite_liq"]],
         real_pcs_z[["Real_PC1", "Real_PC2"]],
     ],
     axis=1
@@ -181,3 +184,25 @@ print("Factors shape:", factors_df.shape)
 
 factors_df.to_excel(OUT_FACTORS, sheet_name="factors", index_label="date")
 print(f"\nSaved: {OUT_FACTORS}")
+
+# Plot all 6 factors in a 3x2 grid (replicating paper Figure 2)
+fig, axes = plt.subplots(3, 2, figsize=(12, 10), sharex=False)
+
+series = [
+    (pc_df_z["PC1_level"],    "First Factor (Level)"),
+    (pc_df_z["PC2_slope"],    "Second Factor (Slope)"),
+    (pc_df_z["PC3_curvature"],"Third Factor (Curvature)"),
+    (real_pcs_z["Real_PC1"],  "Fourth Factor (Real 1)"),
+    (real_pcs_z["Real_PC2"],  "Fifth Factor (Real 2)"),
+    (turnover["composite_liq"], "Sixth Factor (Liquidity)"),
+]
+
+for ax, (s, title) in zip(axes.flatten(), series):
+    ax.plot(s.index, s.values, color="#2a6ebb", linewidth=1.2)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("Year", fontsize=9)
+    ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+    ax.set_axisbelow(True)
+
+plt.tight_layout()
+plt.show()

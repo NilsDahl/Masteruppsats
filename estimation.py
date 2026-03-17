@@ -773,39 +773,240 @@ for m in plot_mats:
     plt.tight_layout()
     plt.show()
 
+# Compute realized average inflation over n months ahead
+def realized_avg_inflation(infl_monthly, horizon_m):
+    """
+    For each date t, compute the average annualized inflation
+    realized over the next horizon_m months.
+    infl_monthly: monthly log CPI change in decimals
+    Returns annualized series in basis points.
+    """
+    # Rolling forward sum / horizon, then annualize (*12) and convert to bp (*10000)
+    realized = (
+        infl_monthly
+        .rolling(window=horizon_m)
+        .mean()
+        .shift(-horizon_m)   # align: value at t = avg inflation from t to t+n
+        * 12                 # annualize
+        * 10_000             # to basis points
+    )
+    return realized
 
-# Model-implied expected inflation vs survey — by horizon
 horizon_map = {
     "2 Year": 24,
     "5 Year": 60,
 }
 
+fname_map = {
+    "2 Year": "survey_vs_model_2y.png",
+    "5 Year": "survey_vs_model_5y.png",
+}
+
 for survey_col, m in horizon_map.items():
     col = f"y_{m}m"
 
-    s_model  = E_inf[col].dropna()    * 10_000
-    s_survey = df_survey[survey_col].dropna() * 10_000
-    s_bei    = BEI_obs[col].dropna()  * 10_000
+    s_model    = E_inf[col].dropna()            * 10_000
+    s_survey   = df_survey[survey_col].dropna() * 10_000
+    s_bei      = BEI_obs[col].dropna()          * 10_000
+    s_realized = realized_avg_inflation(infl_m, m).dropna()
 
     fig, ax = plt.subplots(figsize=(11, 4))
 
-    ax.plot(s_bei.index,    s_bei,    color="#2c2c2c", linewidth=1.8,
-            linestyle="--", label="Breakeven inflation (raw)")
-    ax.plot(s_model.index,  s_model,  color="#e07b39", linewidth=2.0,
+    ax.plot(s_bei.index,      s_bei,      color="#2c2c2c", linewidth=1.5,
+            linestyle="--",   label="Breakeven inflation (raw)")
+    ax.plot(s_model.index,    s_model,    color="#e07b39", linewidth=2.0,
             label="Model-implied expected inflation")
-    ax.plot(s_survey.index, s_survey, color="#9b2335", linewidth=1.8,
+    ax.plot(s_survey.index,   s_survey,   color="#9b2335", linewidth=1.8,
             linestyle=(0, (4, 2)), marker="o", markersize=2.5,
             label="Survey expected inflation")
+    ax.plot(s_realized.index, s_realized, color="#3aaa6e", linewidth=1.8,
+            linestyle="-",    label=f"Realized inflation ({survey_col})")
 
     ax.axhline(0, color="black", linestyle=":", linewidth=0.8)
     ax.set_title(
-        f"Expected Inflation: Model vs Survey vs BEI — {survey_col} horizon",
+        f"Expected vs Realized Inflation — {survey_col} horizon",
         fontsize=13, fontweight="bold", pad=10
     )
     ax.set_ylabel("Basis points", fontsize=11)
-    ax.legend(frameon=True, fontsize=10)
+    ax.legend(frameon=True, fontsize=10, ncol=2)
     ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
     ax.set_axisbelow(True)
 
     plt.tight_layout()
     plt.show()
+
+
+
+################------------------####################
+# Fit diagnostics tables for Latex 
+# One table for yields (nominal + real), one for excess returns
+
+from scipy.stats import skew, kurtosis
+
+def pricing_errors(obs_df, hat_df, maturities, prefix, scale=10_000):
+    rows = []
+    for m in maturities:
+        col = f"{prefix}{m}m"
+        if col not in obs_df.columns or col not in hat_df.columns:
+            continue
+        err = (obs_df[col] - hat_df[col]).dropna() * scale
+        rows.append({
+            "n": m,
+            "Mean":  round(err.mean(), 3),
+            "Std":   round(err.std(),  3),
+            "Skew":  round(skew(err),  3),
+            "Kurt":  round(kurtosis(err, fisher=False), 3),
+        })
+    return pd.DataFrame(rows).set_index("n")
+
+def two_panel_latex(df_top, df_bot, panel_top, panel_bot, caption, label, note=None):
+    col_fmt = "r" + "r" * len(df_top.columns)
+    cols = list(df_top.columns)
+    header = "$n$ (months) & " + " & ".join(cols) + r" \\"
+
+    def rows_block(df):
+        lines = []
+        for idx, row in df.iterrows():
+            vals = " & ".join([f"{idx}"] + [f"{v:.3f}" for v in row.values])
+            lines.append(f"        {vals} \\\\")
+        return "\n".join(lines)
+
+    tex = rf"""
+\begin{{table}}[htbp]
+    \centering
+    \caption{{{caption}}}
+    \label{{{label}}}
+    \begin{{tabular}}{{{col_fmt}}}
+    \toprule
+        {header}
+    \midrule
+        \multicolumn{{{1 + len(cols)}}}{{l}}{{\small\textit{{Panel A: {panel_top}}}}} \\
+    \midrule
+{rows_block(df_top)}
+    \midrule
+        \multicolumn{{{1 + len(cols)}}}{{l}}{{\small\textit{{Panel B: {panel_bot}}}}} \\
+    \midrule
+{rows_block(df_bot)}
+    \bottomrule
+    \end{{tabular}}"""
+
+    if note:
+        tex += rf"""
+    \begin{{minipage}}{{\linewidth}}
+        \vspace{{4pt}}
+        \footnotesize \textit{{Note:}} {note}
+    \end{{minipage}}"""
+
+    tex += "\n\\end{table}"
+    return tex
+
+# Yield table
+tbl_nom_y  = pricing_errors(yobs_Q,   yhat_Q,   [12, 24, 36, 60, 84, 120], "y_")
+tbl_real_y = pricing_errors(yobsR_Q,  yhatR_Q,  [24, 36, 60, 84, 120],     "y_")
+
+# Return table
+tbl_nom_rx  = pricing_errors(rxobs_nom_Q,  rxhat_nom_Q,  [12, 24, 36, 60, 84, 120], "rx_")
+tbl_real_rx = pricing_errors(rxobs_real_Q, rxhat_real_Q, [24, 36, 60, 84, 120],     "rx_")
+
+note_y = ("Mean, Std, Skew, and Kurt refer to the sample mean, standard deviation, "
+          "skewness, and kurtosis of yield pricing errors in basis points. "
+          "Sample: 2004:01--2025:12.")
+
+note_rx = ("Mean, Std, Skew, and Kurt refer to the sample mean, standard deviation, "
+           "skewness, and kurtosis of excess return pricing errors in basis points. "
+           "Sample: 2004:01--2025:12.")
+
+print(two_panel_latex(
+    tbl_nom_y, tbl_real_y,
+    panel_top = "Nominal SGB yield pricing errors",
+    panel_bot = "Real SGBIL yield pricing errors",
+    caption   = ("Yield fit diagnostics. Panel A reports pricing errors for nominal "
+                 "SGB yields and Panel B for real SGBIL yields."),
+    label     = "tab:yield_fit",
+    note      = note_y
+))
+
+print(two_panel_latex(
+    tbl_nom_rx, tbl_real_rx,
+    panel_top = "Nominal SGB excess return pricing errors",
+    panel_bot = "Real SGBIL excess return pricing errors",
+    caption   = ("Excess return fit diagnostics. Panel A reports pricing errors for "
+                 "nominal SGB returns and Panel B for real SGBIL returns."),
+    label     = "tab:ret_fit",
+    note      = note_rx
+))
+
+# ── 5–10y Forward BEI Decomposition ─────────────────────────────────────────
+
+def to_fwd_510(zc_df):
+    """5-10y forward rate: [10*y120 - 5*y60] / 5 = 2*y120 - y60."""
+    return 2.0 * zc_df["y_120m"] - zc_df["y_60m"]
+
+def fwd_liq_510(liq_df):
+    """Apply same linear operator to liquidity component DataFrames."""
+    return 2.0 * liq_df["y_120m"] - liq_df["y_60m"]
+
+# Forward rates under Q and P (nominal and real)
+fwd_nom_Q  = to_fwd_510(yhat_Q)
+fwd_real_Q = to_fwd_510(yhatR_Q)
+fwd_nom_P  = to_fwd_510(yhat_P)
+fwd_real_P = to_fwd_510(yhatR_P)
+
+# Liquidity components of 5-10y forward yields under Q and P
+fwd_liq_nom_Q  = fwd_liq_510(liq_nom_Q)
+fwd_liq_real_Q = fwd_liq_510(liq_real_Q)
+fwd_liq_nom_P  = fwd_liq_510(liq_nom_P)
+fwd_liq_real_P = fwd_liq_510(liq_real_P)
+
+# Raw forward BEI under Q and P
+fwd_bei_Q = fwd_nom_Q - fwd_real_Q
+fwd_bei_P = fwd_nom_P - fwd_real_P
+
+# Liquidity-adjusted forward BEI under Q and P
+fwd_bei_Q_adj = (fwd_nom_Q - fwd_liq_nom_Q) - (fwd_real_Q - fwd_liq_real_Q)
+fwd_bei_P_adj = (fwd_nom_P - fwd_liq_nom_P) - (fwd_real_P - fwd_liq_real_P)
+
+# Decomposition: BEI = E_inf + IRP + LP
+fwd_LP    = fwd_bei_Q     - fwd_bei_Q_adj   # liquidity distortion in raw breakeven
+fwd_IRP   = fwd_bei_Q_adj - fwd_bei_P_adj   # Q vs P wedge on liq-adjusted BEI
+fwd_E_inf = fwd_bei_P_adj                   # liq-adjusted expected inflation under P
+
+# Align to common index
+idx = (
+    fwd_bei_Q.dropna().index
+    .intersection(fwd_IRP.dropna().index)
+    .intersection(fwd_LP.dropna().index)
+    .intersection(fwd_E_inf.dropna().index)
+)
+
+s_bei  = fwd_bei_Q.loc[idx]  * 10_000
+s_irp  = fwd_IRP.loc[idx]    * 10_000
+s_lp   = fwd_LP.loc[idx]     * 10_000
+s_einf = fwd_E_inf.loc[idx]  * 10_000
+
+# Sanity check
+check = (s_einf + s_irp + s_lp - s_bei).abs().max()
+print(f"5-10y forward: max decomposition residual = {check:.4f} bp")
+
+# Plot
+fig, ax = plt.subplots(figsize=(11, 4))
+
+ax.plot(idx, s_bei,  color=colors["BEI"],   linewidth=2.0, linestyle="--",
+        label="5–10y forward breakeven (raw)")
+ax.plot(idx, s_einf, color=colors["E_inf"], linewidth=2.0,
+        label="Expected inflation ($E^P[\\pi]$)")
+ax.plot(idx, s_irp,  color=colors["IRP"],   linewidth=2.0,
+        label="Inflation risk premium")
+ax.plot(idx, s_lp,   color=colors["LP"],    linewidth=2.0,
+        label="Liquidity premium")
+
+ax.axhline(0, color="black", linestyle=":", linewidth=0.8)
+ax.set_title("BEI Decomposition — 5–10y forward",
+             fontsize=13, fontweight="bold")
+ax.set_ylabel("Basis points", fontsize=11)
+ax.legend(frameon=True, fontsize=10, loc="upper right", ncol=2)
+ax.yaxis.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+ax.set_axisbelow(True)
+
+plt.tight_layout()
+plt.show()
