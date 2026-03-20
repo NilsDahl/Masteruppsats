@@ -205,4 +205,5 @@ for ax, (s, title) in zip(axes.flatten(), series):
     ax.set_axisbelow(True)
 
 plt.tight_layout()
+fig.savefig("factors.png", dpi=150, bbox_inches="tight")
 plt.show()

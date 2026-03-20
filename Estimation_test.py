@@ -38,7 +38,8 @@ real_zc_monthgrid_path    = "zero_yields_SGBIL.xlsx"
  
 state_factors = [
     "PC1_level", "PC2_slope", "PC3_curvature",
-    "composite_liq", "Real_PC1", "Real_PC2"
+    "composite_liq", "Real_PC1", "Real_PC2",
+    "infl_trend"                                       # regime factor — free in pi1
 ]
  
 NOM_RET_MONTHS_FULLYEARS  = np.arange(12, 121, 12)
@@ -54,6 +55,19 @@ df_f = read_excel_date_index(factors_path, sheet_name=0)
 df_inf = (
     read_excel_date_index("CPI_and_rate.xlsx", sheet_name="inflation")
     .rename(columns={"monthly log": "inflation"})
+)
+
+# ── Inflation trend factor (24-month trailing mean, annualised) ───────────────
+# Captures low-frequency inflation regime shifts without contaminating the
+# liquidity factor identification. Added to state vector as 7th factor.
+_infl_monthly = df_inf["inflation"] / 100.0          # already monthly log returns
+df_f["infl_trend"] = (
+    _infl_monthly
+    .reindex(df_f.index)
+    .ffill()
+    .rolling(24, min_periods=12)
+    .mean()
+    .mul(12)                                           # annualise to match yield units
 )
  
 df_r = (
@@ -242,6 +256,8 @@ def estimate_model(cutoff_date,
     lb[1 + liq_idx] = -1e-8
     ub[1 + liq_idx] =  1e-8
     x0[1 + liq_idx] =  0.0
+    # infl_trend is intentionally unconstrained — it is the dedicated channel
+    # for inflation regime dynamics and should enter pi1 freely
 
     def tips_AB_local(pi0, pi1):
         A, B = np.zeros(max_n + 1, float), np.zeros((max_n + 1, K), float)
@@ -1095,4 +1111,3 @@ plt.tight_layout()
 plt.subplots_adjust(hspace=0.45)
 fig.savefig("nominal_real_yields.png", dpi=150, bbox_inches="tight")
 plt.show()
-

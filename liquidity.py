@@ -96,7 +96,7 @@ turnover_monthly["liquidity_ma3"] = (
 )# Load Indicator 1: NSS yield fitting errors
 rmse = pd.read_excel(
     "zero_yields_SGBIL.xlsx",
-    sheet_name="fit params",
+    sheet_name="fit_params",
     usecols=["date", "rmse_yield_bp_ext"]
 )
 rmse["date"] = pd.to_datetime(rmse["date"]) + pd.offsets.MonthEnd(0)
@@ -133,11 +133,11 @@ ind2_z = (ind2 - ind2.mean()) / ind2.std(ddof=0)
 ind3_z = (ind3 - ind3.mean()) / ind3.std(ddof=0)
  
 # Weights: ind3 (bid-ask spread) = 50%, ind1 (NSS RMSE) = 25%, ind2 (turnover) = 25%
-composite = 0.25 * ind1_z + 0.25 * ind2_z + 0.50 * ind3_z
-composite = composite + abs(composite.min())
+composite = 1/3 * ind1_z + 1/3 * ind2_z + 1/3 * ind3_z
+composite = (composite - composite.min())   # flip: higher = more liquid
 composite.name = "Liquidity_MA3"
 composite = composite.sort_index()
- 
+
 print("\nComposite liquidity index summary:")
 print(composite.describe().round(4))
  
@@ -157,20 +157,20 @@ fig, axes = plt.subplots(4, 1, figsize=(12, 13), sharex=True)
  
 axes[0].plot(ind1.index, ind1.values, color="#e07b39", lw=1.8, label="NSS RMSE (bp)")
 axes[0].set_ylabel("Basis points")
-axes[0].set_title("Indicator 1 (weight 25%): NS yield fitting error (SGBIL)")
-axes[0].legend(fontsize=9)
+axes[0].set_title("Indicator 1 (weight 33%): NS yield fitting error (SGBIL)")
+axes[0].legend(fontsize=10)
 axes[0].yaxis.grid(True, linestyle=":", alpha=0.6)
  
 axes[1].plot(ind2.index, ind2.values, color="#2a6ebb", lw=1.8, label="Turnover ratio (3m MA)")
 axes[1].set_ylabel("−log(ILB/GVB)")
-axes[1].set_title("Indicator 2 (weight 25%): Relative turnover illiquidity")
-axes[1].legend(fontsize=9)
+axes[1].set_title("Indicator 2 (weight 33%): Relative turnover illiquidity")
+axes[1].legend(fontsize=10)
 axes[1].yaxis.grid(True, linestyle=":", alpha=0.6)
  
 axes[2].plot(ind3.index, ind3.values, color="#8b5cf6", lw=1.8, label="Bid-ask spread illiquidity (real)")
 axes[2].set_ylabel("Spread level")
-axes[2].set_title("Indicator 3 (weight 50%): Bid-ask spread illiquidity (real)")
-axes[2].legend(fontsize=9)
+axes[2].set_title("Indicator 3 (weight 33%): Bid-ask spread illiquidity (real)")
+axes[2].legend(fontsize=10)
 axes[2].yaxis.grid(True, linestyle=":", alpha=0.6)
  
 axes[3].fill_between(composite.index, composite.values, alpha=0.25, color="#3aaa6e")
@@ -178,8 +178,8 @@ axes[3].plot(composite.index, composite.values, color="#3aaa6e", lw=2.0,
              label="Composite liquidity index")
 axes[3].axhline(0, color="black", lw=0.7, linestyle=":")
 axes[3].set_ylabel("Index level")
-axes[3].set_title("Composite SGBIL Liquidity Index (25% / 25% / 50%)")
-axes[3].legend(fontsize=9)
+axes[3].set_title("Composite SGBIL Liquidity Index (33% / 33% / 33%)")
+axes[3].legend(fontsize=10)
 axes[3].yaxis.grid(True, linestyle=":", alpha=0.6)
  
 fig.suptitle("Swedish ILB Liquidity Index Construction", fontsize=13, fontweight="bold", y=1.01)
@@ -187,4 +187,4 @@ plt.tight_layout()
 plt.savefig("liquidity_index_diagnostics.png", dpi=150, bbox_inches="tight")
 plt.show()
 print("Saved: liquidity_index_diagnostics.png")
- 
+
