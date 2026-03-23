@@ -182,7 +182,8 @@ def estimate_model(cutoff_date,
                    .sort_index().reindex(columns=asset_order))
     Sigma_e_hat = (E_hat.to_numpy().T @ E_hat.to_numpy()) / E_hat.shape[0]
     eigvals     = np.linalg.eigvalsh(Sigma_e_hat)
-    W           = np.linalg.inv(Sigma_e_hat + max(1e-10, 1e-6 * np.max(eigvals)) * np.eye(Sigma_e_hat.shape[0]))
+    # adding a ridge
+    W = np.linalg.inv(Sigma_e_hat + max(1e-10, 1e-9 * np.max(eigvals)) * np.eye(Sigma_e_hat.shape[0]))
     if verbose: print("Sigma_e_hat eig min/max:", np.min(eigvals), np.max(eigvals))
  
     # ── Phi_tilde via GLS ─────────────────────────────────────────────────────
@@ -238,10 +239,10 @@ def estimate_model(cutoff_date,
                    np.r_[ 0.20, np.full(K,  1.0)] - 1e-12)
     lb   = np.r_[-0.20, np.full(K, -1.0)]
     ub   = np.r_[ 0.20, np.full(K,  1.0)]
-    liq_idx = state_factors.index("composite_liq")
-    lb[1 + liq_idx] = -1e-8
-    ub[1 + liq_idx] =  1e-8
-    x0[1 + liq_idx] =  0.0
+    #liq_idx = state_factors.index("composite_liq")
+    #lb[1 + liq_idx] = -1e-8
+    #ub[1 + liq_idx] =  1e-8
+    #x0[1 + liq_idx] =  0.0
 
     def tips_AB_local(pi0, pi1):
         A, B = np.zeros(max_n + 1, float), np.zeros((max_n + 1, K), float)
@@ -1095,4 +1096,3 @@ plt.tight_layout()
 plt.subplots_adjust(hspace=0.45)
 fig.savefig("nominal_real_yields.png", dpi=150, bbox_inches="tight")
 plt.show()
-
