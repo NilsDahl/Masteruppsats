@@ -103,12 +103,13 @@ rmse["date"] = pd.to_datetime(rmse["date"]) + pd.offsets.MonthEnd(0)
 rmse = rmse.set_index("date")["rmse_yield_bp_ext"].sort_index()
 rmse.name = "rmse_bp"
  
-# Load Indicator 3: Bid-ask spread illiquidity (real)
+# Load Indicator 3: Bid-ask spread ratio (from Stens excel)
 spread_df = pd.read_excel(
-    "statsobligationer_data.xlsx",
-    sheet_name="Spread Analysis",
-    usecols=["Date", "ILLIQUIDITY_REAL"]
+    "price_factors.xlsx",
+    sheet_name="liquidity",
+    usecols=[0, 1],   # column A = Date, column B = your series
 )
+spread_df.columns = ["Date", "ILLIQUIDITY_REAL"]  # rename for consistency
 spread_df["Date"] = pd.to_datetime(spread_df["Date"]) + pd.offsets.MonthEnd(0)
 spread_df = spread_df.dropna(subset=["ILLIQUIDITY_REAL"])
 spread_df = spread_df.set_index("Date")["ILLIQUIDITY_REAL"].sort_index()
@@ -134,7 +135,7 @@ ind3_z = (ind3 - ind3.mean()) / ind3.std(ddof=0)
  
 # Weights: ind3 (bid-ask spread) = 50%, ind1 (NSS RMSE) = 25%, ind2 (turnover) = 25%
 composite = 1/3 * ind1_z + 1/3 * ind2_z + 1/3 * ind3_z
-composite = (composite - composite.min())   # flip: higher = more liquid
+composite = (composite - composite.min())   
 composite.name = "Liquidity_MA3"
 composite = composite.sort_index()
 

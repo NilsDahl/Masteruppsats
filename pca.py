@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 # Paths
 
 NOMINAL_PATH = "zero_yields_SGB.xlsx"
-REAL_PATH    = "zero_yields_SGBIL.xlsx"
+REAL_PATH    = "zero_yields_SGBIL_2.xlsx"
 TURN_PATH    = "turnover_monthly_with_liquidity.xlsx"
 
 OUT_NOMINAL  = "nominal_pcs_5m_120m.xlsx"

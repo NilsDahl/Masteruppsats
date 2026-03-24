@@ -27,18 +27,17 @@ def month_cols(df):
 def col_to_m(c):
     return int(c.split("_")[1][:-1])
  
- 
 # ══════════════════════════════════════════════════════════════════════════════
 # USER INPUTS
 # ══════════════════════════════════════════════════════════════════════════════
  
 factors_path              = "pcas_and_liquidity.xlsx"
 nominal_zc_monthgrid_path = "zero_yields_SGB.xlsx"
-real_zc_monthgrid_path    = "zero_yields_SGBIL.xlsx"
+real_zc_monthgrid_path    = "zero_yields_SGBIL_2.xlsx"
  
 state_factors = [
     "PC1_level", "PC2_slope", "PC3_curvature",
-    "composite_liq", "Real_PC1", "Real_PC2"
+    "Real_PC1", "Real_PC2", "composite_liq"
 ]
  
 NOM_RET_MONTHS_FULLYEARS  = np.arange(12, 121, 12)
@@ -186,12 +185,40 @@ def estimate_model(cutoff_date,
     W = np.linalg.inv(Sigma_e_hat + max(1e-10, 1e-9 * np.max(eigvals)) * np.eye(Sigma_e_hat.shape[0]))
     if verbose: print("Sigma_e_hat eig min/max:", np.min(eigvals), np.max(eigvals))
  
-    # ── Phi_tilde via GLS ─────────────────────────────────────────────────────
+
+
+    ####### CRUCIAL PART
+
+        # ── Phi_tilde via GLS ─────────────────────────────────────────────────────
     B_ols   = params_df[x_lead_cols].to_numpy(dtype=float)
     phi_gls = np.linalg.solve(B_ols.T @ W @ B_ols,
-                               B_ols.T @ W @ (-params_df[x_now_cols].to_numpy(dtype=float)))
-    if verbose: print("max |eig(phi_gls)|:", np.max(np.abs(np.linalg.eigvals(phi_gls))))
- 
+                            B_ols.T @ W @ (-params_df[x_now_cols].to_numpy(dtype=float)))
+
+    # ── Enforce stationarity of phi_gls ──────────────────────────────────────────
+    # The nominal B-recursion is B[n] = phi_gls.T @ B[n-1] - delta1.
+    # If any eigenvalue of phi_gls has modulus >= 1, B[n] diverges at long
+    # maturities and the nominal 10y yield explodes while real yields (whose
+    # recursion adds pi1 each step, rotating away from the explosive direction)
+    # remain finite. We project explosive eigenvalues back inside the unit disc.
+    eigvals_c, eigvecs_c = np.linalg.eig(phi_gls)
+    sr = np.max(np.abs(eigvals_c))
+    if sr >= 1.0:
+        if verbose:
+            print(f"  !! phi_gls spectral radius = {sr:.6f} >= 1 — projecting to stationarity")
+        # Scale only eigenvalues that violate stationarity; leave stable ones untouched
+        scale = np.where(np.abs(eigvals_c) >= 1.0,
+                        0.999 / np.abs(eigvals_c),   # pull to just inside unit circle
+                        1.0)
+        phi_gls = (eigvecs_c * (eigvals_c * scale)) @ np.linalg.inv(eigvecs_c)
+        phi_gls = phi_gls.real   # discard negligible imaginary part from float arithmetic
+
+    if verbose:
+        print("max |eig(phi_gls)|:", np.max(np.abs(np.linalg.eigvals(phi_gls))))
+
+    ######## 
+
+
+
     # ── alpha_gls, B_gls via SUR ──────────────────────────────────────────────
     Rpi_wide = (df_ols_long.pivot(index="date", columns="asset", values="R_pi")
                 .sort_index().reindex(columns=asset_order))
@@ -239,10 +266,10 @@ def estimate_model(cutoff_date,
                    np.r_[ 0.20, np.full(K,  1.0)] - 1e-12)
     lb   = np.r_[-0.20, np.full(K, -1.0)]
     ub   = np.r_[ 0.20, np.full(K,  1.0)]
-    liq_idx = state_factors.index("composite_liq")
-    lb[1 + liq_idx] = -1e-8
-    ub[1 + liq_idx] =  1e-8
-    x0[1 + liq_idx] =  0.0
+    #liq_idx = state_factors.index("composite_liq")
+    #lb[1 + liq_idx] = -1e-8
+    #ub[1 + liq_idx] =  1e-8
+    #x0[1 + liq_idx] =  0.0
 
     def tips_AB_local(pi0, pi1):
         A, B = np.zeros(max_n + 1, float), np.zeros((max_n + 1, K), float)
@@ -497,7 +524,7 @@ def rescore_E_inf(res_oos, df_f, state_factors):
 # ══════════════════════════════════════════════════════════════════════════════
  
 results = estimate_model(
-    cutoff_date               = "2022-12-31",
+    cutoff_date               = "2099-12-31",
     df_f                      = df_f,
     df_inf                    = df_inf,
     df_r                      = df_r,
@@ -1096,4 +1123,3 @@ plt.tight_layout()
 plt.subplots_adjust(hspace=0.45)
 fig.savefig("nominal_real_yields.png", dpi=150, bbox_inches="tight")
 plt.show()
-

@@ -37,10 +37,10 @@ def col_to_m(c):
 
 # User inputs
 
-factors_path = "pcas_and_liquidity.xlsx"
+factors_path = "price_factors.xlsx"
 
 nominal_zc_monthgrid_path = "zero_yields_SGB.xlsx"
-real_zc_monthgrid_path    = "zero_yields_SGBIL.xlsx"
+real_zc_monthgrid_path    = "zero_yields_SGBIL_2.xlsx"
 
 state_factors = [
     "PC1_level", "PC2_slope", "PC3_curvature",

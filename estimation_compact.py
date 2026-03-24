@@ -27,18 +27,17 @@ def month_cols(df):
 def col_to_m(c):
     return int(c.split("_")[1][:-1])
  
- 
 # ══════════════════════════════════════════════════════════════════════════════
 # USER INPUTS
 # ══════════════════════════════════════════════════════════════════════════════
  
 factors_path              = "pcas_and_liquidity.xlsx"
 nominal_zc_monthgrid_path = "zero_yields_SGB.xlsx"
-real_zc_monthgrid_path    = "zero_yields_SGBIL.xlsx"
+real_zc_monthgrid_path    = "zero_yields_SGBIL_2.xlsx"
  
 state_factors = [
-    "PC1_level", "PC2_slope", "PC3_curvature",
-    "composite_liq", "Real_PC1", "Real_PC2"
+    "PC1_level", "PC2_slope", "PC3_curvature", 
+    "Real_PC1", "Real_PC2", "composite_liq"
 ]
  
 NOM_RET_MONTHS_FULLYEARS  = np.arange(12, 121, 12)
@@ -186,12 +185,11 @@ def estimate_model(cutoff_date,
     W = np.linalg.inv(Sigma_e_hat + max(1e-10, 1e-9 * np.max(eigvals)) * np.eye(Sigma_e_hat.shape[0]))
     if verbose: print("Sigma_e_hat eig min/max:", np.min(eigvals), np.max(eigvals))
  
-    # ── Phi_tilde via GLS ─────────────────────────────────────────────────────
     B_ols   = params_df[x_lead_cols].to_numpy(dtype=float)
     phi_gls = np.linalg.solve(B_ols.T @ W @ B_ols,
                                B_ols.T @ W @ (-params_df[x_now_cols].to_numpy(dtype=float)))
     if verbose: print("max |eig(phi_gls)|:", np.max(np.abs(np.linalg.eigvals(phi_gls))))
- 
+    
     # ── alpha_gls, B_gls via SUR ──────────────────────────────────────────────
     Rpi_wide = (df_ols_long.pivot(index="date", columns="asset", values="R_pi")
                 .sort_index().reindex(columns=asset_order))
