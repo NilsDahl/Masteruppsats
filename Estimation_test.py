@@ -131,7 +131,11 @@ def estimate_model(cutoff_date,
     Sigma   = var_res.sigma_u
     K       = len(state_factors)
     mu_x    = np.linalg.solve(np.eye(K) - Phi, mu)
-    if verbose: print(var_res.summary())
+    if verbose:
+        sr_Phi = np.max(np.abs(np.linalg.eigvals(Phi)))
+        print(f"  Phi spectral radius: {sr_Phi:.6f} "
+              f"({'OK' if sr_Phi < 1.0 else '!! NON-STATIONARY'})")
+        print(var_res.summary())
  
     # ── Short rate OLS ────────────────────────────────────────────────────────
     df_rate_reg = df_model_data[["short_rate_dec"]].join(df_model_data[state_factors], how="inner").dropna()
@@ -185,37 +189,38 @@ def estimate_model(cutoff_date,
     W = np.linalg.inv(Sigma_e_hat + max(1e-10, 1e-9 * np.max(eigvals)) * np.eye(Sigma_e_hat.shape[0]))
     if verbose: print("Sigma_e_hat eig min/max:", np.min(eigvals), np.max(eigvals))
  
+    # ── Phi_tilde via GLS ────────────────────────────────────────────────────
+    B_ols       = params_df[x_lead_cols].to_numpy(dtype=float)
+    phi_gls_raw = np.linalg.solve(B_ols.T @ W @ B_ols,
+                                  B_ols.T @ W @ (-params_df[x_now_cols].to_numpy(dtype=float)))
 
-
-    ####### CRUCIAL PART
-
-        # ── Phi_tilde via GLS ─────────────────────────────────────────────────────
-    B_ols   = params_df[x_lead_cols].to_numpy(dtype=float)
-    phi_gls = np.linalg.solve(B_ols.T @ W @ B_ols,
-                            B_ols.T @ W @ (-params_df[x_now_cols].to_numpy(dtype=float)))
-
-    # ── Enforce stationarity of phi_gls ──────────────────────────────────────────
+    # ── Enforce stationarity of phi_gls ──────────────────────────────────────
     # The nominal B-recursion is B[n] = phi_gls.T @ B[n-1] - delta1.
     # If any eigenvalue of phi_gls has modulus >= 1, B[n] diverges at long
-    # maturities and the nominal 10y yield explodes while real yields (whose
-    # recursion adds pi1 each step, rotating away from the explosive direction)
-    # remain finite. We project explosive eigenvalues back inside the unit disc.
-    eigvals_c, eigvecs_c = np.linalg.eig(phi_gls)
-    sr = np.max(np.abs(eigvals_c))
-    if sr >= 1.0:
-        if verbose:
-            print(f"  !! phi_gls spectral radius = {sr:.6f} >= 1 — projecting to stationarity")
-        # Scale only eigenvalues that violate stationarity; leave stable ones untouched
-        scale = np.where(np.abs(eigvals_c) >= 1.0,
-                        0.999 / np.abs(eigvals_c),   # pull to just inside unit circle
-                        1.0)
+    # maturities — causing exploding model yields. We project any explosive
+    # eigenvalues back strictly inside the unit circle using the eigendecomposition:
+    #   phi_gls = V D V^{-1}  ->  replace D with D_scaled  ->  reconstruct.
+    # Only eigenvalues with |lambda| >= 1 are scaled; stable ones are untouched.
+    eigvals_c, eigvecs_c = np.linalg.eig(phi_gls_raw)
+    sr_raw      = np.max(np.abs(eigvals_c))
+    was_clipped = sr_raw >= 1.0
+
+    if was_clipped:
+        scale   = np.where(np.abs(eigvals_c) >= 1.0,
+                           0.999 / np.abs(eigvals_c),  # shrink to just inside unit circle
+                           1.0)                         # leave stable eigenvalues alone
         phi_gls = (eigvecs_c * (eigvals_c * scale)) @ np.linalg.inv(eigvecs_c)
-        phi_gls = phi_gls.real   # discard negligible imaginary part from float arithmetic
+        phi_gls = phi_gls.real  # discard float noise imaginary residual (~1e-15)
+    else:
+        phi_gls = phi_gls_raw
+
+    sr_final = np.max(np.abs(np.linalg.eigvals(phi_gls)))
 
     if verbose:
-        print("max |eig(phi_gls)|:", np.max(np.abs(np.linalg.eigvals(phi_gls))))
-
-    ######## 
+        if was_clipped:
+            print(f"  !! phi_gls projected: sr {sr_raw:.6f} -> {sr_final:.6f}")
+        else:
+            print(f"  phi_gls spectral radius: {sr_final:.6f} (no projection needed)")
 
 
 
@@ -267,9 +272,9 @@ def estimate_model(cutoff_date,
     lb   = np.r_[-0.20, np.full(K, -1.0)]
     ub   = np.r_[ 0.20, np.full(K,  1.0)]
     #liq_idx = state_factors.index("composite_liq")
-    #lb[1 + liq_idx] = -1e-8
-    #ub[1 + liq_idx] =  1e-8
-    #x0[1 + liq_idx] =  0.0
+    #lb[1 + liq_idx] = -1.0    # allow negative (correct sign)
+    #ub[1 + liq_idx] =  1e-8   # but not positive (wrong sign)
+    #x0[1 + liq_idx] = -1e-5
 
     def tips_AB_local(pi0, pi1):
         A, B = np.zeros(max_n + 1, float), np.zeros((max_n + 1, K), float)
@@ -336,29 +341,126 @@ def estimate_model(cutoff_date,
     yhatR_P, Xpr_real_P = yhat_from_AB(A_real_P, B_real_P, df_real_y_.index, real_months_)
  
     # ── BEI decomposition ─────────────────────────────────────────────────────
+    # Following Abrahams et al. (2016), the liquidity factor contributes to
+    # yields through THREE distinct channels:
+    #
+    #   Channel 1 — State-dependent (time-varying):
+    #       -(B_liq[n]' x_t) / tau
+    #       Contemporaneous impact of current liquidity conditions on yields.
+    #
+    #   Channel 2 — Unconditional/intercept (constant across time):
+    #       Comes from sum_{i=0}^{n-1} B_liq[i]' mu_tilde in the A recursion.
+    #       Reflects the average contribution of liquidity to yields via the
+    #       risk-neutral drift.
+    #
+    #   Channel 3 — Convexity (constant across time):
+    #       Comes from 0.5 * B_liq[i]' Sigma B_full[i] cross-terms in A.
+    #       Reflects the covariance between the liquidity loading and all other
+    #       factor loadings through the Sigma matrix.
+    #
+    # Implementation: we run a PARALLEL AB recursion (AB_liq_nominal /
+    # AB_liq_real) that tracks only the liquidity-attributable parts of A and B.
+    # The total liq contribution to yield n is:
+    #       liq_yield(n,t) = -(A_liq[n] + B_liq[n]' x_t) / tau
+    # Channels 2+3 are in A_liq (time-invariant); Channel 1 is in B_liq' x_t.
+    # The liquidity-adjusted yield is: y_adj = y - liq_yield.
+
     liq_idx = state_factors.index("composite_liq")
     common  = sorted(set(yhat_Q.columns).intersection(yhatR_Q.columns)
                      .intersection(yhat_P.columns).intersection(yhatR_P.columns))
- 
+
+    def AB_liq_nominal(Phi_dyn, mu_dyn, d1, max_n):
+        """
+        Parallel AB recursion tracking only the liquidity factor's contribution
+        to the nominal bond A and B arrays.
+
+        B_liq[n]: liq-driven part of B[n], propagated via Phi_dyn.T and seeded
+                  by d1[liq_idx] at each step.
+        A_liq[n]: liq-driven part of A[n], accumulating:
+                  - Channel 2: B_liq[n-1] @ mu_dyn
+                  - Channel 3: B_liq[n-1] @ Sigma @ B_full[n-1]  (cross-term)
+        B_full[n]: the full nominal B array, needed for the Channel 3 cross-term.
+        """
+        A_liq  = np.zeros(max_n + 1, float)
+        B_liq  = np.zeros((max_n + 1, K), float)
+        B_full = np.zeros((max_n + 1, K), float)
+        for n in range(1, max_n + 1):
+            # Full B recursion (mirrors AB_nominal exactly)
+            B_full[n] = Phi_dyn.T @ B_full[n-1] - d1
+
+            # Liq-only B recursion: propagate existing liq loading through Phi,
+            # then subtract only the liq element of delta1
+            B_liq[n]           = Phi_dyn.T @ B_liq[n-1]
+            B_liq[n][liq_idx] -= d1[liq_idx]
+
+            # Channel 2 — unconditional mean contribution
+            a_ch2 = B_liq[n-1] @ mu_dyn
+
+            # Channel 3 — convexity cross-term: 0.5*(B_liq' Sigma B_full +
+            #   B_full' Sigma B_liq) = B_liq @ Sigma @ B_full (Sigma symmetric)
+            a_ch3 = B_liq[n-1] @ Sigma @ B_full[n-1]
+
+            A_liq[n] = A_liq[n-1] + a_ch2 + a_ch3
+
+        return A_liq, B_liq
+
+    def AB_liq_real(Phi_dyn, mu_dyn, d1, p1, max_n):
+        """
+        Same as AB_liq_nominal but for the real bond recursion.
+        B^pi = B[n-1] + pi1 enters both B and A updates. The liq element of
+        pi1 seeds an additional channel into B_liq and A_liq at each step.
+        """
+        A_liq   = np.zeros(max_n + 1, float)
+        B_liq   = np.zeros((max_n + 1, K), float)
+        B_full  = np.zeros((max_n + 1, K), float)
+        for n in range(1, max_n + 1):
+            Bp_full = B_full[n-1] + p1
+            B_full[n] = Phi_dyn.T @ Bp_full - d1
+
+            # Liq-only B^pi: carry forward B_liq and add pi1[liq_idx]
+            Bp_liq = B_liq[n-1].copy()
+            Bp_liq[liq_idx] += p1[liq_idx]
+
+            B_liq[n]           = Phi_dyn.T @ Bp_liq
+            B_liq[n][liq_idx] -= d1[liq_idx]
+
+            # Channel 2
+            a_ch2 = Bp_liq @ mu_dyn
+
+            # Channel 3: cross-term between liq Bp and full Bp
+            a_ch3 = Bp_liq @ Sigma @ Bp_full
+
+            A_liq[n] = A_liq[n-1] + a_ch2 + a_ch3
+
+        return A_liq, B_liq
+
+    # Compute liq-only AB for all four measure/bond combinations
+    A_liq_nom_Q,  B_liq_nom_Q  = AB_liq_nominal(phi_gls, mu_tilde_gls, delta1_, max_n_y)
+    A_liq_real_Q, B_liq_real_Q = AB_liq_real(   phi_gls, mu_tilde_gls, delta1_, pi1_hat, max_n_y)
+    A_liq_nom_P,  B_liq_nom_P  = AB_liq_nominal(Phi,     mu,           delta1_, max_n_y)
+    A_liq_real_P, B_liq_real_P = AB_liq_real(   Phi,     mu,           delta1_, pi1_hat, max_n_y)
+
+    # Build total liquidity-contribution-to-yield DataFrames
+    # liq_yield(n,t) = -(A_liq[n] + B_liq[n]' x_t) / tau
     liq_nom_Q  = pd.DataFrame(index=yhat_Q.index)
     liq_real_Q = pd.DataFrame(index=yhatR_Q.index)
     liq_nom_P  = pd.DataFrame(index=yhat_P.index)
     liq_real_P = pd.DataFrame(index=yhatR_P.index)
- 
+
     for n in nom_months_:
         col = f"y_{n}m"
         if col in common:
             tau = n / 12.0
-            liq_nom_Q[col] = -(B_nom_Q[n][liq_idx] * Xpr_nom_Q.iloc[:, liq_idx].values) / tau
-            liq_nom_P[col] = -(B_nom_P[n][liq_idx] * Xpr_nom_P.iloc[:, liq_idx].values) / tau
- 
+            liq_nom_Q[col] = -(A_liq_nom_Q[n] + Xpr_nom_Q.to_numpy() @ B_liq_nom_Q[n]) / tau
+            liq_nom_P[col] = -(A_liq_nom_P[n] + Xpr_nom_P.to_numpy() @ B_liq_nom_P[n]) / tau
+
     for n in real_months_:
         col = f"y_{n}m"
         if col in common:
             tau = n / 12.0
-            liq_real_Q[col] = -(B_real_Q[n][liq_idx] * Xpr_real_Q.iloc[:, liq_idx].values) / tau
-            liq_real_P[col] = -(B_real_P[n][liq_idx] * Xpr_real_P.iloc[:, liq_idx].values) / tau
- 
+            liq_real_Q[col] = -(A_liq_real_Q[n] + Xpr_real_Q.to_numpy() @ B_liq_real_Q[n]) / tau
+            liq_real_P[col] = -(A_liq_real_P[n] + Xpr_real_P.to_numpy() @ B_liq_real_P[n]) / tau
+
     bei_Q     = yhat_Q[common]  - yhatR_Q[common]
     bei_Q_adj = (yhat_Q[common] - liq_nom_Q[common]) - (yhatR_Q[common] - liq_real_Q[common])
     bei_P_adj = (yhat_P[common] - liq_nom_P[common]) - (yhatR_P[common] - liq_real_P[common])
@@ -440,7 +542,11 @@ def estimate_model(cutoff_date,
         B_real_P = B_real_P,
         nom_months  = nom_months_,
         real_months = real_months_,
-        liq_idx = liq_idx
+        liq_idx = liq_idx,
+        # ── projection diagnostics (always present, used by OOS loop) ────────
+        sr_raw      = sr_raw,       # spectral radius of phi_gls before projection
+        sr_final    = sr_final,     # spectral radius after (== sr_raw when no clip)
+        was_clipped = was_clipped,  # True if any eigenvalue was shrunk
     )
  
  
@@ -449,7 +555,11 @@ def estimate_model(cutoff_date,
 # ══════════════════════════════════════════════════════════════════════════════
  
 def rescore_E_inf(res_oos, df_f, state_factors):
-    """Re-apply vintage parameters to the full factor history."""
+    """
+    Re-apply vintage parameters to the full factor history.
+    Uses the full three-channel liquidity stripping (Channels 1+2+3)
+    consistent with estimate_model().
+    """
     phi_gls      = res_oos["phi_gls"]
     mu_tilde_gls = res_oos["mu_tilde_gls"]
     Phi          = res_oos["Phi"]
@@ -464,14 +574,14 @@ def rescore_E_inf(res_oos, df_f, state_factors):
     K            = len(state_factors)
     liq_idx      = state_factors.index("composite_liq")
     max_n_y      = int(max(nom_months_.max(), real_months_.max()))
- 
+
     def AB_nominal(Phi_dyn, mu_dyn, d0, d1, max_n):
         A, B = np.zeros(max_n + 1, float), np.zeros((max_n + 1, K), float)
         for n in range(1, max_n + 1):
             B[n] = Phi_dyn.T @ B[n-1] - d1
             A[n] = A[n-1] + B[n-1] @ mu_dyn + 0.5*(B[n-1] @ Sigma @ B[n-1]) - d0
         return A, B
- 
+
     def AB_real(Phi_dyn, mu_dyn, d0, d1, p0, p1, max_n):
         A, B = np.zeros(max_n + 1, float), np.zeros((max_n + 1, K), float)
         d0_R = d0 - p0
@@ -480,41 +590,72 @@ def rescore_E_inf(res_oos, df_f, state_factors):
             B[n] = Phi_dyn.T @ Bp - d1
             A[n] = A[n-1] + Bp @ mu_dyn + 0.5*(Bp @ Sigma @ Bp) - d0_R
         return A, B
- 
-    X_full  = df_f[state_factors].dropna()
-    X_arr   = X_full.to_numpy(float)
-    liq_vals = X_full.iloc[:, liq_idx].values
- 
+
+    # Parallel liq-only AB recursions (three-channel, mirrors estimate_model)
+    def AB_liq_nominal(Phi_dyn, mu_dyn, d1, max_n):
+        A_liq  = np.zeros(max_n + 1, float)
+        B_liq  = np.zeros((max_n + 1, K), float)
+        B_full = np.zeros((max_n + 1, K), float)
+        for n in range(1, max_n + 1):
+            B_full[n]           = Phi_dyn.T @ B_full[n-1] - d1
+            B_liq[n]            = Phi_dyn.T @ B_liq[n-1]
+            B_liq[n][liq_idx]  -= d1[liq_idx]
+            A_liq[n] = A_liq[n-1] + B_liq[n-1] @ mu_dyn + B_liq[n-1] @ Sigma @ B_full[n-1]
+        return A_liq, B_liq
+
+    def AB_liq_real(Phi_dyn, mu_dyn, d1, p1, max_n):
+        A_liq  = np.zeros(max_n + 1, float)
+        B_liq  = np.zeros((max_n + 1, K), float)
+        B_full = np.zeros((max_n + 1, K), float)
+        for n in range(1, max_n + 1):
+            Bp_full             = B_full[n-1] + p1
+            B_full[n]           = Phi_dyn.T @ Bp_full - d1
+            Bp_liq              = B_liq[n-1].copy()
+            Bp_liq[liq_idx]    += p1[liq_idx]
+            B_liq[n]            = Phi_dyn.T @ Bp_liq
+            B_liq[n][liq_idx]  -= d1[liq_idx]
+            A_liq[n] = A_liq[n-1] + Bp_liq @ mu_dyn + Bp_liq @ Sigma @ Bp_full
+        return A_liq, B_liq
+
+    X_full = df_f[state_factors].dropna()
+    X_arr  = X_full.to_numpy(float)
+
     def yhat_full(A, B, months):
         out = pd.DataFrame(index=X_full.index)
         for n in months:
             out[f"y_{n}m"] = -(A[n] + X_arr @ B[n]) / (n / 12.0)
         return out
- 
+
+    A_nom_P,  B_nom_P  = AB_nominal(Phi, mu, delta0, delta1, max_n_y)
+    A_real_P, B_real_P = AB_real(   Phi, mu, delta0, delta1, pi0, pi1, max_n_y)
+    # Q-measure needed for full yields (E_inf = bei_P_adj uses P only, but
+    # common index requires Q columns too)
     A_nom_Q,  B_nom_Q  = AB_nominal(phi_gls, mu_tilde_gls, delta0, delta1, max_n_y)
     A_real_Q, B_real_Q = AB_real(   phi_gls, mu_tilde_gls, delta0, delta1, pi0, pi1, max_n_y)
-    A_nom_P,  B_nom_P  = AB_nominal(Phi,     mu,           delta0, delta1, max_n_y)
-    A_real_P, B_real_P = AB_real(   Phi,     mu,           delta0, delta1, pi0, pi1, max_n_y)
- 
+
     yhat_Q_  = yhat_full(A_nom_Q,  B_nom_Q,  nom_months_)
     yhatR_Q_ = yhat_full(A_real_Q, B_real_Q, real_months_)
     yhat_P_  = yhat_full(A_nom_P,  B_nom_P,  nom_months_)
     yhatR_P_ = yhat_full(A_real_P, B_real_P, real_months_)
- 
+
     common = sorted(set(yhat_Q_.columns).intersection(yhatR_Q_.columns)
                     .intersection(yhat_P_.columns).intersection(yhatR_P_.columns))
- 
+
+    # Three-channel liq contributions (P-measure only needed for E_inf)
+    A_liq_nom_P,  B_liq_nom_P  = AB_liq_nominal(Phi, mu, delta1, max_n_y)
+    A_liq_real_P, B_liq_real_P = AB_liq_real(   Phi, mu, delta1, pi1, max_n_y)
+
     liq_nom_P_  = pd.DataFrame(index=X_full.index)
     liq_real_P_ = pd.DataFrame(index=X_full.index)
     for n in nom_months_:
         col = f"y_{n}m"
         if col in common:
-            liq_nom_P_[col] = -(B_nom_P[n][liq_idx] * liq_vals) / (n / 12.0)
+            liq_nom_P_[col] = -(A_liq_nom_P[n] + X_arr @ B_liq_nom_P[n]) / (n / 12.0)
     for n in real_months_:
         col = f"y_{n}m"
         if col in common:
-            liq_real_P_[col] = -(B_real_P[n][liq_idx] * liq_vals) / (n / 12.0)
- 
+            liq_real_P_[col] = -(A_liq_real_P[n] + X_arr @ B_liq_real_P[n]) / (n / 12.0)
+
     return ((yhat_P_[common] - liq_nom_P_[common]) -
             (yhatR_P_[common] - liq_real_P_[common]))
  
@@ -892,11 +1033,15 @@ print(two_panel_latex(tbl_nom_rx, tbl_real_rx,
 oos_start     = "2009-01-01"
 reestim_dates = pd.date_range(start=oos_start, end="2025-12-31", freq="YS-JAN")
 oos_E_inf_list = []
- 
+sr_log         = []   # projection audit trail — one row per OOS window
+
 for reestim_date in reestim_dates:
+    # ── Training cutoff ───────────────────────────────────────────────────────
+    # cutoff is the last month-end BEFORE reestim_date, so no training data
+    # bleeds into the OOS window.  MonthEnd(1) on Jan 1 -> Dec 31 prior year.
     cutoff = reestim_date - pd.offsets.MonthEnd(1)
     print(f"\n>>> OOS estimation: training up to {cutoff.date()} ...")
- 
+
     res_oos = estimate_model(
         cutoff_date               = cutoff,
         df_f                      = df_f,
@@ -909,14 +1054,51 @@ for reestim_date in reestim_dates:
         REAL_RET_MONTHS_FULLYEARS = REAL_RET_MONTHS_FULLYEARS,
         verbose                   = False,
     )
- 
-    E_inf_full  = rescore_E_inf(res_oos, df_f, state_factors)
+
+    # ── Collect projection diagnostics ────────────────────────────────────────
+    sr_log.append({
+        "cutoff"     : cutoff,
+        "sr_raw"     : res_oos["sr_raw"],
+        "sr_final"   : res_oos["sr_final"],
+        "was_clipped": res_oos["was_clipped"],
+    })
+
+    # ── Re-score E_inf on full factor history with vintage parameters ─────────
+    # IMPORTANT: rescore_E_inf intentionally uses df_f (full history), not the
+    # truncated training window. This is correct — we apply the vintage model
+    # parameters to all available factor observations to get a time series of
+    # E_inf. The OOS slice below then restricts to the forecast window only.
+    # This is standard pseudo-OOS practice (cf. Adrian et al. 2013).
+    E_inf_full = rescore_E_inf(res_oos, df_f, state_factors)
+
+    # ── OOS window: reestim_date through end of same calendar year ────────────
+    # YearEnd(1) from Jan 1 always lands on Dec 31 of that year — verified.
+    # Windows are non-overlapping for month-end data: window i ends Dec 31,
+    # window i+1 starts Jan 31 (first month-end >= Jan 1 next year).
     next_cutoff = reestim_date + pd.offsets.YearEnd(1)
     oos_E_inf_list.append(E_inf_full.loc[reestim_date:next_cutoff])
- 
+
+# ── Assemble OOS series ───────────────────────────────────────────────────────
+# Dedup guard: in case any month-end date falls exactly on a window boundary
+# and appears in two consecutive slices (should not happen but safe to check).
 E_inf_oos = pd.concat(oos_E_inf_list)
 E_inf_oos = E_inf_oos[~E_inf_oos.index.duplicated(keep="first")].sort_index()
 print(f"\nE_inf_oos range: {E_inf_oos.index.min()} – {E_inf_oos.index.max()}, shape: {E_inf_oos.shape}")
+
+# ── Projection summary ────────────────────────────────────────────────────────
+sr_df     = pd.DataFrame(sr_log).set_index("cutoff")
+n_clipped = sr_df["was_clipped"].sum()
+n_total   = len(sr_df)
+print(f"\n{'='*60}")
+print(f"Projection summary: {n_clipped}/{n_total} OOS windows required clipping")
+print(f"Max raw spectral radius across all windows: {sr_df['sr_raw'].max():.6f}")
+print(f"Min raw spectral radius across all windows: {sr_df['sr_raw'].min():.6f}")
+if n_clipped > 0:
+    print("\nWindows where projection was applied:")
+    print(sr_df[sr_df["was_clipped"]][["sr_raw", "sr_final"]].round(6).to_string())
+else:
+    print("No windows required projection — phi_gls was stationary in all OOS samples.")
+print(f"{'='*60}\n")
  
  
 # ══════════════════════════════════════════════════════════════════════════════

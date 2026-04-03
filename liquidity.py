@@ -120,7 +120,7 @@ ind1 = rmse.dropna()
 ind2 = turnover_monthly["liquidity_ma3"].dropna()
 ind3 = spread_df.dropna()
 common_idx = ind1.index.intersection(ind2.index).intersection(ind3.index)
- 
+
 ind1 = ind1.loc[common_idx]
 ind2 = ind2.loc[common_idx]
 ind3 = ind3.loc[common_idx]
@@ -131,7 +131,7 @@ print(f"  N = {len(common_idx)} months")
 # Standardize all three indicators
 ind1_z = (ind1 - ind1.mean()) / ind1.std(ddof=0)
 ind2_z = (ind2 - ind2.mean()) / ind2.std(ddof=0)
-ind3_z = (ind3 - ind3.mean()) / ind3.std(ddof=0)
+ind3_z = ind3
  
 # Weights: ind3 (bid-ask spread) = 50%, ind1 (NSS RMSE) = 25%, ind2 (turnover) = 25%
 composite = 1/3 * ind1_z + 1/3 * ind2_z + 1/3 * ind3_z

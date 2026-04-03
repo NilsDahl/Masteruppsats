@@ -36,7 +36,7 @@ nominal_zc_monthgrid_path = "zero_yields_SGB.xlsx"
 real_zc_monthgrid_path    = "zero_yields_SGBIL_2.xlsx"
  
 state_factors = [
-    "PC1_level", "PC2_slope", "PC3_curvature", 
+    "PC1_level", "PC2_slope", "PC3_curvature",
     "Real_PC1", "Real_PC2", "composite_liq"
 ]
  
@@ -73,8 +73,7 @@ df_survey = pd.read_excel(
 df_survey["date"] = pd.to_datetime(df_survey["Month"], format="%b-%Y")
 df_survey = df_survey.drop(columns=["Month"]).set_index("date").sort_index()
 df_survey = df_survey / 100.0
- 
- 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE ESTIMATION FUNCTION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -131,7 +130,11 @@ def estimate_model(cutoff_date,
     Sigma   = var_res.sigma_u
     K       = len(state_factors)
     mu_x    = np.linalg.solve(np.eye(K) - Phi, mu)
-    if verbose: print(var_res.summary())
+    if verbose:
+        sr_Phi = np.max(np.abs(np.linalg.eigvals(Phi)))
+        print(f"  Phi spectral radius: {sr_Phi:.6f} "
+              f"({'OK' if sr_Phi < 1.0 else '!! NON-STATIONARY'})")
+        print(var_res.summary())
  
     # ── Short rate OLS ────────────────────────────────────────────────────────
     df_rate_reg = df_model_data[["short_rate_dec"]].join(df_model_data[state_factors], how="inner").dropna()
@@ -185,11 +188,41 @@ def estimate_model(cutoff_date,
     W = np.linalg.inv(Sigma_e_hat + max(1e-10, 1e-9 * np.max(eigvals)) * np.eye(Sigma_e_hat.shape[0]))
     if verbose: print("Sigma_e_hat eig min/max:", np.min(eigvals), np.max(eigvals))
  
-    B_ols   = params_df[x_lead_cols].to_numpy(dtype=float)
-    phi_gls = np.linalg.solve(B_ols.T @ W @ B_ols,
-                               B_ols.T @ W @ (-params_df[x_now_cols].to_numpy(dtype=float)))
-    if verbose: print("max |eig(phi_gls)|:", np.max(np.abs(np.linalg.eigvals(phi_gls))))
-    
+    # ── Phi_tilde via GLS ────────────────────────────────────────────────────
+    B_ols       = params_df[x_lead_cols].to_numpy(dtype=float)
+    phi_gls_raw = np.linalg.solve(B_ols.T @ W @ B_ols,
+                                  B_ols.T @ W @ (-params_df[x_now_cols].to_numpy(dtype=float)))
+
+    # ── Enforce stationarity of phi_gls ──────────────────────────────────────
+    # The nominal B-recursion is B[n] = phi_gls.T @ B[n-1] - delta1.
+    # If any eigenvalue of phi_gls has modulus >= 1, B[n] diverges at long
+    # maturities — causing exploding model yields. We project any explosive
+    # eigenvalues back strictly inside the unit circle using the eigendecomposition:
+    #   phi_gls = V D V^{-1}  ->  replace D with D_scaled  ->  reconstruct.
+    # Only eigenvalues with |lambda| >= 1 are scaled; stable ones are untouched.
+    eigvals_c, eigvecs_c = np.linalg.eig(phi_gls_raw)
+    sr_raw      = np.max(np.abs(eigvals_c))
+    was_clipped = sr_raw >= 1.0
+
+    if was_clipped:
+        scale   = np.where(np.abs(eigvals_c) >= 1.0,
+                           0.999 / np.abs(eigvals_c),  # shrink to just inside unit circle
+                           1.0)                         # leave stable eigenvalues alone
+        phi_gls = (eigvecs_c * (eigvals_c * scale)) @ np.linalg.inv(eigvecs_c)
+        phi_gls = phi_gls.real  # discard float noise imaginary residual (~1e-15)
+    else:
+        phi_gls = phi_gls_raw
+
+    sr_final = np.max(np.abs(np.linalg.eigvals(phi_gls)))
+
+    if verbose:
+        if was_clipped:
+            print(f"  !! phi_gls projected: sr {sr_raw:.6f} -> {sr_final:.6f}")
+        else:
+            print(f"  phi_gls spectral radius: {sr_final:.6f} (no projection needed)")
+
+
+
     # ── alpha_gls, B_gls via SUR ──────────────────────────────────────────────
     Rpi_wide = (df_ols_long.pivot(index="date", columns="asset", values="R_pi")
                 .sort_index().reindex(columns=asset_order))
@@ -238,9 +271,10 @@ def estimate_model(cutoff_date,
     lb   = np.r_[-0.20, np.full(K, -1.0)]
     ub   = np.r_[ 0.20, np.full(K,  1.0)]
     #liq_idx = state_factors.index("composite_liq")
-    #lb[1 + liq_idx] = -1e-8
-    #ub[1 + liq_idx] =  1e-8
-    #x0[1 + liq_idx] =  0.0
+    #lb[1 + liq_idx] = -1.0    # allow negative (correct sign)
+    #ub[1 + liq_idx] =  1e-8   # but not positive (wrong sign)
+    #x0[1 + liq_idx] = -1e-5
+
 
     def tips_AB_local(pi0, pi1):
         A, B = np.zeros(max_n + 1, float), np.zeros((max_n + 1, K), float)
@@ -411,7 +445,11 @@ def estimate_model(cutoff_date,
         B_real_P = B_real_P,
         nom_months  = nom_months_,
         real_months = real_months_,
-        liq_idx = liq_idx
+        liq_idx = liq_idx,
+        # ── projection diagnostics (always present, used by OOS loop) ────────
+        sr_raw      = sr_raw,       # spectral radius of phi_gls before projection
+        sr_final    = sr_final,     # spectral radius after (== sr_raw when no clip)
+        was_clipped = was_clipped,  # True if any eigenvalue was shrunk
     )
  
  
@@ -863,11 +901,15 @@ print(two_panel_latex(tbl_nom_rx, tbl_real_rx,
 oos_start     = "2009-01-01"
 reestim_dates = pd.date_range(start=oos_start, end="2025-12-31", freq="YS-JAN")
 oos_E_inf_list = []
- 
+sr_log         = []   # projection audit trail — one row per OOS window
+
 for reestim_date in reestim_dates:
+    # ── Training cutoff ───────────────────────────────────────────────────────
+    # cutoff is the last month-end BEFORE reestim_date, so no training data
+    # bleeds into the OOS window.  MonthEnd(1) on Jan 1 -> Dec 31 prior year.
     cutoff = reestim_date - pd.offsets.MonthEnd(1)
     print(f"\n>>> OOS estimation: training up to {cutoff.date()} ...")
- 
+
     res_oos = estimate_model(
         cutoff_date               = cutoff,
         df_f                      = df_f,
@@ -880,14 +922,51 @@ for reestim_date in reestim_dates:
         REAL_RET_MONTHS_FULLYEARS = REAL_RET_MONTHS_FULLYEARS,
         verbose                   = False,
     )
- 
-    E_inf_full  = rescore_E_inf(res_oos, df_f, state_factors)
+
+    # ── Collect projection diagnostics ────────────────────────────────────────
+    sr_log.append({
+        "cutoff"     : cutoff,
+        "sr_raw"     : res_oos["sr_raw"],
+        "sr_final"   : res_oos["sr_final"],
+        "was_clipped": res_oos["was_clipped"],
+    })
+
+    # ── Re-score E_inf on full factor history with vintage parameters ─────────
+    # IMPORTANT: rescore_E_inf intentionally uses df_f (full history), not the
+    # truncated training window. This is correct — we apply the vintage model
+    # parameters to all available factor observations to get a time series of
+    # E_inf. The OOS slice below then restricts to the forecast window only.
+    # This is standard pseudo-OOS practice (cf. Adrian et al. 2013).
+    E_inf_full = rescore_E_inf(res_oos, df_f, state_factors)
+
+    # ── OOS window: reestim_date through end of same calendar year ────────────
+    # YearEnd(1) from Jan 1 always lands on Dec 31 of that year — verified.
+    # Windows are non-overlapping for month-end data: window i ends Dec 31,
+    # window i+1 starts Jan 31 (first month-end >= Jan 1 next year).
     next_cutoff = reestim_date + pd.offsets.YearEnd(1)
     oos_E_inf_list.append(E_inf_full.loc[reestim_date:next_cutoff])
- 
+
+# ── Assemble OOS series ───────────────────────────────────────────────────────
+# Dedup guard: in case any month-end date falls exactly on a window boundary
+# and appears in two consecutive slices (should not happen but safe to check).
 E_inf_oos = pd.concat(oos_E_inf_list)
 E_inf_oos = E_inf_oos[~E_inf_oos.index.duplicated(keep="first")].sort_index()
 print(f"\nE_inf_oos range: {E_inf_oos.index.min()} – {E_inf_oos.index.max()}, shape: {E_inf_oos.shape}")
+
+# ── Projection summary ────────────────────────────────────────────────────────
+sr_df     = pd.DataFrame(sr_log).set_index("cutoff")
+n_clipped = sr_df["was_clipped"].sum()
+n_total   = len(sr_df)
+print(f"\n{'='*60}")
+print(f"Projection summary: {n_clipped}/{n_total} OOS windows required clipping")
+print(f"Max raw spectral radius across all windows: {sr_df['sr_raw'].max():.6f}")
+print(f"Min raw spectral radius across all windows: {sr_df['sr_raw'].min():.6f}")
+if n_clipped > 0:
+    print("\nWindows where projection was applied:")
+    print(sr_df[sr_df["was_clipped"]][["sr_raw", "sr_final"]].round(6).to_string())
+else:
+    print("No windows required projection — phi_gls was stationary in all OOS samples.")
+print(f"{'='*60}\n")
  
  
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1093,33 +1172,4 @@ for ax in axes:
 plt.tight_layout()
 plt.subplots_adjust(hspace=0.45)
 fig.savefig("nominal_real_yields.png", dpi=150, bbox_inches="tight")
-plt.show()
-
-fig, ax1 = plt.subplots(figsize=(11, 5))
-
-# ── BEI (left axis) ─────────────────────────────────────
-for col, label in [("y_24m", "2-year"), ("y_60m", "5-year"), ("y_120m", "10-year")]:
-    ax1.plot(BEI_obs.index, BEI_obs[col] * 10000, linewidth=2, label=f"BEI {label}")
-
-ax1.axhline(0, color="black", linestyle=":", linewidth=0.8)
-ax1.set_ylabel("BEI (basis points)")
-ax1.set_title("Breakeven inflation vs Liquidity index", fontsize=13, fontweight="bold")
-ax1.grid(axis="y", linestyle=":", alpha=0.7)
-
-# ── Liquidity (right axis) ──────────────────────────────
-ax2 = ax1.twinx()
-
-liq_series = df_model_data["composite_liq"]
-
-ax2.plot(liq_series.index, liq_series, 
-         color="black", linestyle="--", linewidth=2, label="Liquidity index")
-
-ax2.set_ylabel("Liquidity index")
-
-# ── Combined legend ─────────────────────────────────────
-lines1, labels1 = ax1.get_legend_handles_labels()
-lines2, labels2 = ax2.get_legend_handles_labels()
-ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-
-plt.tight_layout()
 plt.show()
